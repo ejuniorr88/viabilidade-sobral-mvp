@@ -1,18 +1,44 @@
 import streamlit as st
-from streamlit_folium import st_folium
+import json
 import folium
+from streamlit_folium import st_folium
 
-st.set_page_config(page_title="Viabilidade Sobral - MVP", layout="wide")
+st.set_page_config(layout="wide")
 
-st.title("Viabilidade Sobral (MVP)")
-st.write("Clique no mapa para capturar a coordenada do lote.")
+st.title("Mapa de Zoneamento - Sobral")
 
-# Centro aproximado de Sobral
-m = folium.Map(location=[-3.689, -40.348], zoom_start=13)
+# Carregar GeoJSONs
+with open("data/zoneamento.json", "r", encoding="utf-8") as f:
+    zoneamento = json.load(f)
 
-data = st_folium(m, width=1100, height=600)
+with open("data/ruas.json", "r", encoding="utf-8") as f:
+    ruas = json.load(f)
 
-if data and data.get("last_clicked"):
-    lat = data["last_clicked"]["lat"]
-    lng = data["last_clicked"]["lng"]
-    st.success(f"Coordenada selecionada: {lat:.6f}, {lng:.6f}")
+# Criar mapa
+m = folium.Map(location=[-3.69, -40.35], zoom_start=13)
+
+# Camada de zoneamento
+folium.GeoJson(
+    zoneamento,
+    name="Zoneamento",
+    style_function=lambda x: {
+        "fillColor": "#3388ff",
+        "color": "#000000",
+        "weight": 1,
+        "fillOpacity": 0.4,
+    },
+).add_to(m)
+
+# Camada de ruas
+folium.GeoJson(
+    ruas,
+    name="Ruas",
+    style_function=lambda x: {
+        "color": "#ff0000",
+        "weight": 2,
+    },
+).add_to(m)
+
+folium.LayerControl().add_to(m)
+
+st_folium(m, width=1200, height=700)
