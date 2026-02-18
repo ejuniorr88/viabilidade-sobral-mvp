@@ -62,7 +62,7 @@ def ruas_style(_feat):
 
 
 def ensure_properties_keys(geojson: dict, keys: list[str]) -> dict:
-    """Garante que todas as features tenham as chaves (evita AssertionError do folium tooltip)."""
+    """Evita AssertionError do folium tooltip: garante que todo mundo tenha as chaves."""
     feats = (geojson or {}).get("features") or []
     for feat in feats:
         props = feat.get("properties")
@@ -73,6 +73,22 @@ def ensure_properties_keys(geojson: dict, keys: list[str]) -> dict:
             if k not in props or props[k] is None:
                 props[k] = ""
     return geojson
+
+
+def html_popup(zona_sigla: str, zona_nome: str, rua_nome: str, hierarquia: str, dist_m: float | None):
+    # HTML simples (sem depender de libs)
+    dtxt = f"{dist_m:.1f} m" if dist_m is not None else "—"
+    return f"""
+    <div style="font-family: Arial, sans-serif; font-size: 13px; line-height: 1.35;">
+      <div style="font-weight:700; font-size:14px; margin-bottom:6px;">Consulta do ponto</div>
+      <div><b>Zona:</b> {zona_nome or "—"}</div>
+      <div><b>Sigla:</b> {zona_sigla or "—"}</div>
+      <hr style="margin:8px 0;" />
+      <div><b>Rua:</b> {rua_nome or "—"}</div>
+      <div><b>Hierarquia:</b> {hierarquia or "—"}</div>
+      <div style="color:#666;"><b>Distância aprox.:</b> {dtxt}</div>
+    </div>
+    """
 
 
 @st.cache_data(show_spinner=False)
@@ -136,7 +152,7 @@ def find_nearest_street(ruas_index, lat: float, lon: float, max_dist_m: float = 
     for line, props in ruas_index:
         try:
             line_m = transform(to_3857, line)
-            d = p_m.distance(line_m)
+            d = p_m.distance(line_m)  # metros
             if d < best_d:
                 best_d = d
                 best_props = props
@@ -162,7 +178,6 @@ ruas = None
 if RUAS_FILE.exists():
     ruas = load_geojson(RUAS_FILE)
 
-# 🔥 IMPORTANTÍSSIMO: evitar erro do folium tooltip
 zone_fields = ["sigla", "zona", "zona_sigla", "nome", "NOME", "SIGLA", "name"]
 zoneamento = ensure_properties_keys(zoneamento, zone_fields)
 
@@ -174,6 +189,11 @@ ruas_index = build_ruas_index(ruas) if ruas else None
 # Layout: mapa + painel
 # =============================
 col_map, col_panel = st.columns([3, 1], gap="large")
+
+# --- Primeiro: captura do clique (state) ---
+# A gente mantém o último clique numa sessão para continuar mostrando o pin/popup
+if "click" not in st.session_state:
+    st.session_state["click"] = None
 
 with col_map:
     m = folium.Map(location=[-3.69, -40.35], zoom_start=13, tiles="OpenStreetMap")
@@ -203,18 +223,92 @@ with col_map:
 
     folium.LayerControl(collapsed=False).add_to(m)
 
+    # Renderiza uma vez para capturar clique
     out = st_folium(m, width=1200, height=700)
+
+    # Atualiza clique (session)
+    last = (out or {}).get("last_clicked")
+    if last:
+        st.session_state["click"] = {"lat": float(last["lat"]), "lng": float(last["lng"])}
+
+# --- Agora: com o clique salvo, recria o mapa COM pin + popup ---
+with col_map:
+    click = st.session_state.get("click")
+
+    # Se não tem clique ainda, não precisa redesenhar (evita flicker)
+    if click:
+        m2 = folium.Map(location=[-3.69, -40.35], zoom_start=13, tiles="OpenStreetMap")
+
+        folium.GeoJson(
+            zoneamento,
+            name="Zoneamento",
+            style_function=zone_style,
+            highlight_function=lambda x: {"weight": 3, "color": "#000000", "fillOpacity": 0.45},
+            tooltip=folium.GeoJsonTooltip(
+                fields=zone_fields,
+                aliases=zone_aliases,
+                sticky=True,
+                labels=True,
+            ),
+        ).add_to(m2)
+
+        if ruas:
+            folium.GeoJson(
+                ruas,
+                name="Ruas",
+                style_function=ruas_style,
+                interactive=False,
+            ).add_to(m2)
+
+        folium.LayerControl(collapsed=False).add_to(m2)
+
+        lat = click["lat"]
+        lon = click["lng"]
+
+        # Busca zona/rua para montar o popup
+        props_zone = find_zone_for_click(zone_index, lat, lon)
+
+        zona_sigla = ""
+        zona_nome = ""
+        if props_zone:
+            zona_sigla = get_prop(props_zone, "sigla", "SIGLA", "zona_sigla", "ZONA_SIGLA", "name")
+            zona_nome = get_prop(props_zone, "zona", "ZONA", "nome", "NOME")
+
+        rua_nome = ""
+        hierarquia = ""
+        dist_m = None
+        if ruas_index:
+            props_rua, dist_m = find_nearest_street(ruas_index, lat, lon, max_dist_m=80.0)
+            if props_rua:
+                rua_nome = get_prop(props_rua, "log_ofic", "LOG_OFIC", "name", "NOME")
+                hierarquia = get_prop(props_rua, "hierarquia", "HIERARQUIA")
+
+        # ✅ PIN + POPUP (zona + rua + hierarquia)
+        popup_html = html_popup(zona_sigla, zona_nome, rua_nome, hierarquia, dist_m)
+        folium.Marker(
+            location=[lat, lon],
+            tooltip="Ponto selecionado",
+            popup=folium.Popup(popup_html, max_width=380),
+            icon=folium.Icon(color="blue", icon="info-sign"),
+        ).add_to(m2)
+
+        # Centraliza no clique
+        m2.location = [lat, lon]
+        m2.zoom_start = 16
+
+        st_folium(m2, width=1200, height=700, key="map_with_pin")
+
 
 with col_panel:
     st.subheader("Consulta por clique")
 
-    last = (out or {}).get("last_clicked")
-    if not last:
+    click = st.session_state.get("click")
+    if not click:
         st.info("Clique em qualquer ponto no mapa para ver a zona e a rua aqui.")
         st.stop()
 
-    lat = float(last.get("lat"))
-    lon = float(last.get("lng"))
+    lat = float(click["lat"])
+    lon = float(click["lng"])
 
     st.write("**Coordenadas clicadas**")
     st.code(f"lat: {lat:.6f}\nlon: {lon:.6f}", language="text")
@@ -253,4 +347,7 @@ with col_panel:
         st.write("Zoneamento:")
         st.json(props_zone or {})
         st.write("Rua:")
-        st.json((props_rua if ruas_index else {}) or {})
+        if ruas_index:
+            st.json(props_rua or {})
+        else:
+            st.json({})
