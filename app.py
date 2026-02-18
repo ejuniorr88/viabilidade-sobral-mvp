@@ -100,7 +100,9 @@ folium.GeoJson(
     ruas,
     name="Ruas",
     style_function=ruas_style,
+    interactive=False,  # <- importante: ruas não "pegam" o clique
 ).add_to(m)
+
 
 folium.LayerControl(collapsed=False).add_to(m)
 
