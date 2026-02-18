@@ -7,6 +7,8 @@ from streamlit_folium import st_folium
 
 from shapely.geometry import shape, Point
 from shapely.prepared import prep
+from shapely.ops import transform
+from pyproj import Transformer
 
 
 # =============================
@@ -19,9 +21,8 @@ DATA_DIR = Path("data")
 ZONE_FILE = DATA_DIR / "zoneamento.json"
 RUAS_FILE = DATA_DIR / "ruas.json"
 
-# Campos que vamos tentar mostrar (tooltip)
-ZONE_FIELDS = ["sigla", "zona", "zona_sigla", "nome", "NOME", "SIGLA"]
-ZONE_ALIASES = ["Sigla: ", "Zona: ", "Sigla Zona: ", "Nome: ", "Nome: ", "Sigla: "]
+# Converte graus (EPSG:4326) -> metros (EPSG:3857) para medir distâncias
+to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True).transform
 
 
 # =============================
@@ -48,7 +49,7 @@ def color_for_zone(sigla: str) -> str:
 
 def zone_style(feat):
     props = (feat or {}).get("properties") or {}
-    sigla = get_prop(props, "sigla", "SIGLA", "zona_sigla", "ZONA_SIGLA")
+    sigla = get_prop(props, "sigla", "SIGLA", "zona_sigla", "ZONA_SIGLA", "name")
     return {
         "fillColor": color_for_zone(sigla),
         "color": "#222222",
@@ -61,23 +62,6 @@ def ruas_style(_feat):
     return {"color": "#ff4d4d", "weight": 2, "opacity": 0.9}
 
 
-def ensure_fields_in_properties(geojson: dict, fields: list[str]) -> dict:
-    """
-    Evita AssertionError do Folium:
-    garante que todas as features tenham todas as chaves do tooltip.
-    """
-    feats = (geojson or {}).get("features") or []
-    for feat in feats:
-        props = feat.get("properties")
-        if props is None:
-            props = {}
-            feat["properties"] = props
-        for f in fields:
-            if f not in props:
-                props[f] = ""
-    return geojson
-
-
 @st.cache_data(show_spinner=False)
 def load_geojson(path: Path):
     with path.open("r", encoding="utf-8") as f:
@@ -86,6 +70,10 @@ def load_geojson(path: Path):
 
 @st.cache_resource(show_spinner=False)
 def build_zone_index(zone_geojson: dict):
+    """
+    Pré-processa polígonos do zoneamento para consulta rápida.
+    Retorna lista de (prepared_geom, original_geom, props).
+    """
     out = []
     features = (zone_geojson or {}).get("features") or []
     for feat in features:
@@ -112,6 +100,54 @@ def find_zone_for_click(index, lat: float, lon: float):
     return None
 
 
+@st.cache_resource(show_spinner=False)
+def build_ruas_index(ruas_geojson: dict):
+    """
+    Pré-processa as linhas de ruas.
+    Retorna lista de (geom_linestring, props).
+    """
+    out = []
+    features = (ruas_geojson or {}).get("features") or []
+    for feat in features:
+        geom = feat.get("geometry")
+        props = feat.get("properties") or {}
+        if not geom:
+            continue
+        try:
+            shp = shape(geom)  # LineString / MultiLineString
+            out.append((shp, props))
+        except Exception:
+            continue
+    return out
+
+
+def find_nearest_street(ruas_index, lat: float, lon: float, max_dist_m: float = 60.0):
+    """
+    Retorna (props, dist_m) da rua mais próxima do clique.
+    max_dist_m evita retornar rua muito longe.
+    """
+    p = Point(lon, lat)
+    p_m = transform(to_3857, p)
+
+    best_props = None
+    best_d = 10**18
+
+    for line, props in ruas_index:
+        try:
+            line_m = transform(to_3857, line)
+            d = p_m.distance(line_m)  # metros
+            if d < best_d:
+                best_d = d
+                best_props = props
+        except Exception:
+            continue
+
+    if best_props is not None and best_d <= max_dist_m:
+        return best_props, best_d
+
+    return None, None
+
+
 # =============================
 # Carregar dados
 # =============================
@@ -120,13 +156,13 @@ if not ZONE_FILE.exists():
     st.stop()
 
 zoneamento = load_geojson(ZONE_FILE)
-zoneamento = ensure_fields_in_properties(zoneamento, ZONE_FIELDS)  # <-- FIX DO ERRO
 
 ruas = None
 if RUAS_FILE.exists():
     ruas = load_geojson(RUAS_FILE)
 
 zone_index = build_zone_index(zoneamento)
+ruas_index = build_ruas_index(ruas) if ruas else None
 
 
 # =============================
@@ -137,32 +173,32 @@ col_map, col_panel = st.columns([3, 1], gap="large")
 with col_map:
     m = folium.Map(location=[-3.69, -40.35], zoom_start=13, tiles="OpenStreetMap")
 
-    # Zoneamento com tooltip (agora não quebra)
+    zone_fields = ["sigla", "zona", "zona_sigla", "nome", "NOME", "SIGLA", "name"]
+    zone_aliases = ["Sigla: ", "Zona: ", "Sigla Zona: ", "Nome: ", "Nome: ", "Sigla: ", "Nome: "]
+
     folium.GeoJson(
         zoneamento,
         name="Zoneamento",
         style_function=zone_style,
         highlight_function=lambda x: {"weight": 3, "color": "#000000", "fillOpacity": 0.45},
         tooltip=folium.GeoJsonTooltip(
-            fields=ZONE_FIELDS,
-            aliases=ZONE_ALIASES,
+            fields=zone_fields,
+            aliases=zone_aliases,
             sticky=True,
             labels=True,
         ),
     ).add_to(m)
 
-    # Ruas (não captura clique)
     if ruas:
         folium.GeoJson(
             ruas,
             name="Ruas",
             style_function=ruas_style,
-            interactive=False,
+            interactive=False,  # NÃO rouba clique
         ).add_to(m)
 
     folium.LayerControl(collapsed=False).add_to(m)
 
-    # Render e captura do clique
     out = st_folium(m, width=1200, height=700)
 
 with col_panel:
@@ -170,30 +206,48 @@ with col_panel:
 
     last = (out or {}).get("last_clicked")
     if not last:
-        st.info("Clique em qualquer ponto dentro de Sobral para ver a zona aqui.")
+        st.info("Clique em qualquer ponto no mapa para ver a zona e a rua aqui.")
         st.stop()
 
-    lat = last.get("lat")
-    lon = last.get("lng")
+    lat = float(last.get("lat"))
+    lon = float(last.get("lng"))
 
     st.write("**Coordenadas clicadas**")
     st.code(f"lat: {lat:.6f}\nlon: {lon:.6f}", language="text")
 
-    props = find_zone_for_click(zone_index, lat, lon)
+    # ===== Zona =====
+    props_zone = find_zone_for_click(zone_index, lat, lon)
+    if props_zone:
+        sigla = get_prop(props_zone, "sigla", "SIGLA", "zona_sigla", "ZONA_SIGLA", "name")
+        zona = get_prop(props_zone, "zona", "ZONA", "nome", "NOME")
+        st.success("Zona encontrada ✅")
+        st.write("**Sigla:**", sigla if sigla else "—")
+        st.write("**Zona:**", zona if zona else "—")
+    else:
+        st.warning("Não encontrei uma zona para esse ponto (talvez fora do zoneamento).")
 
-    if not props:
-        st.warning("Não encontrei uma zona para esse ponto (talvez esteja fora do zoneamento).")
-        st.stop()
+    st.divider()
 
-    sigla = get_prop(props, "sigla", "SIGLA", "zona_sigla", "ZONA_SIGLA")
-    zona = get_prop(props, "zona", "ZONA", "nome", "NOME")
-    zona_sigla = get_prop(props, "zona_sigla", "ZONA_SIGLA")
+    # ===== Rua mais próxima =====
+    if ruas_index:
+        props_rua, dist_m = find_nearest_street(ruas_index, lat, lon, max_dist_m=80.0)
 
-    st.success("Zona encontrada ✅")
-    st.write("**Sigla**:", sigla if sigla else "—")
-    st.write("**Zona**:", zona if zona else "—")
-    if zona_sigla:
-        st.write("**Sigla Zona**:", zona_sigla)
+        if props_rua:
+            nome_rua = get_prop(props_rua, "log_ofic", "LOG_OFIC", "name", "NOME")
+            hierarquia = get_prop(props_rua, "hierarquia", "HIERARQUIA")
+            st.info("Rua mais próxima 🛣️")
+            st.write("**Logradouro:**", nome_rua if nome_rua else "—")
+            if hierarquia:
+                st.write("**Hierarquia:**", hierarquia)
+            st.caption(f"Distância aprox.: {dist_m:.1f} m")
+        else:
+            st.write("**Rua mais próxima:** não encontrada (muito longe do clique).")
+    else:
+        st.write("**Ruas:** ruas.json não encontrado.")
 
+    # Debug opcional
     with st.expander("Ver properties completas (debug)"):
-        st.json(props)
+        st.write("Zoneamento:")
+        st.json(props_zone or {})
+        st.write("Rua:")
+        st.json((props_rua if ruas_index else {}) or {})
