@@ -21,7 +21,6 @@ DATA_DIR = Path("data")
 ZONE_FILE = DATA_DIR / "zoneamento.json"
 RUAS_FILE = DATA_DIR / "ruas.json"
 
-# Converte graus (EPSG:4326) -> metros (EPSG:3857) para medir distâncias
 to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True).transform
 
 
@@ -62,6 +61,20 @@ def ruas_style(_feat):
     return {"color": "#ff4d4d", "weight": 2, "opacity": 0.9}
 
 
+def ensure_properties_keys(geojson: dict, keys: list[str]) -> dict:
+    """Garante que todas as features tenham as chaves (evita AssertionError do folium tooltip)."""
+    feats = (geojson or {}).get("features") or []
+    for feat in feats:
+        props = feat.get("properties")
+        if props is None:
+            props = {}
+            feat["properties"] = props
+        for k in keys:
+            if k not in props or props[k] is None:
+                props[k] = ""
+    return geojson
+
+
 @st.cache_data(show_spinner=False)
 def load_geojson(path: Path):
     with path.open("r", encoding="utf-8") as f:
@@ -70,10 +83,6 @@ def load_geojson(path: Path):
 
 @st.cache_resource(show_spinner=False)
 def build_zone_index(zone_geojson: dict):
-    """
-    Pré-processa polígonos do zoneamento para consulta rápida.
-    Retorna lista de (prepared_geom, original_geom, props).
-    """
     out = []
     features = (zone_geojson or {}).get("features") or []
     for feat in features:
@@ -102,10 +111,6 @@ def find_zone_for_click(index, lat: float, lon: float):
 
 @st.cache_resource(show_spinner=False)
 def build_ruas_index(ruas_geojson: dict):
-    """
-    Pré-processa as linhas de ruas.
-    Retorna lista de (geom_linestring, props).
-    """
     out = []
     features = (ruas_geojson or {}).get("features") or []
     for feat in features:
@@ -114,18 +119,14 @@ def build_ruas_index(ruas_geojson: dict):
         if not geom:
             continue
         try:
-            shp = shape(geom)  # LineString / MultiLineString
+            shp = shape(geom)
             out.append((shp, props))
         except Exception:
             continue
     return out
 
 
-def find_nearest_street(ruas_index, lat: float, lon: float, max_dist_m: float = 60.0):
-    """
-    Retorna (props, dist_m) da rua mais próxima do clique.
-    max_dist_m evita retornar rua muito longe.
-    """
+def find_nearest_street(ruas_index, lat: float, lon: float, max_dist_m: float = 80.0):
     p = Point(lon, lat)
     p_m = transform(to_3857, p)
 
@@ -135,7 +136,7 @@ def find_nearest_street(ruas_index, lat: float, lon: float, max_dist_m: float = 
     for line, props in ruas_index:
         try:
             line_m = transform(to_3857, line)
-            d = p_m.distance(line_m)  # metros
+            d = p_m.distance(line_m)
             if d < best_d:
                 best_d = d
                 best_props = props
@@ -161,6 +162,10 @@ ruas = None
 if RUAS_FILE.exists():
     ruas = load_geojson(RUAS_FILE)
 
+# 🔥 IMPORTANTÍSSIMO: evitar erro do folium tooltip
+zone_fields = ["sigla", "zona", "zona_sigla", "nome", "NOME", "SIGLA", "name"]
+zoneamento = ensure_properties_keys(zoneamento, zone_fields)
+
 zone_index = build_zone_index(zoneamento)
 ruas_index = build_ruas_index(ruas) if ruas else None
 
@@ -173,7 +178,6 @@ col_map, col_panel = st.columns([3, 1], gap="large")
 with col_map:
     m = folium.Map(location=[-3.69, -40.35], zoom_start=13, tiles="OpenStreetMap")
 
-    zone_fields = ["sigla", "zona", "zona_sigla", "nome", "NOME", "SIGLA", "name"]
     zone_aliases = ["Sigla: ", "Zona: ", "Sigla Zona: ", "Nome: ", "Nome: ", "Sigla: ", "Nome: "]
 
     folium.GeoJson(
@@ -194,7 +198,7 @@ with col_map:
             ruas,
             name="Ruas",
             style_function=ruas_style,
-            interactive=False,  # NÃO rouba clique
+            interactive=False,
         ).add_to(m)
 
     folium.LayerControl(collapsed=False).add_to(m)
@@ -245,7 +249,6 @@ with col_panel:
     else:
         st.write("**Ruas:** ruas.json não encontrado.")
 
-    # Debug opcional
     with st.expander("Ver properties completas (debug)"):
         st.write("Zoneamento:")
         st.json(props_zone or {})
