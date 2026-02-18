@@ -1,34 +1,37 @@
 import json
+from pathlib import Path
+
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
+
 from shapely.geometry import shape, Point
+from shapely.prepared import prep
 
 
-st.set_page_config(layout="wide")
+# =============================
+# Config
+# =============================
+st.set_page_config(layout="wide", page_title="Mapa de Zoneamento - Sobral")
 st.title("Mapa de Zoneamento - Sobral")
 
-# ===== Carregar GeoJSONs =====
-with open("data/zoneamento.json", "r", encoding="utf-8") as f:
-    zoneamento = json.load(f)
+DATA_DIR = Path("data")
+ZONE_FILE = DATA_DIR / "zoneamento.json"
+RUAS_FILE = DATA_DIR / "ruas.json"
 
-with open("data/ruas.json", "r", encoding="utf-8") as f:
-    ruas = json.load(f)
 
-# ===== Funções auxiliares =====
-def get_prop(feat, *keys):
-    """Pega a primeira property existente dentre as chaves informadas."""
-    props = (feat or {}).get("properties") or {}
+# =============================
+# Utils
+# =============================
+def get_prop(props: dict, *keys) -> str:
+    props = props or {}
     for k in keys:
         if k in props and props[k] not in (None, ""):
             return str(props[k])
     return ""
 
+
 def color_for_zone(sigla: str) -> str:
-    """
-    Paleta simples e estável (sem bibliotecas extras).
-    Você pode ajustar depois.
-    """
     palette = [
         "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
         "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
@@ -38,8 +41,10 @@ def color_for_zone(sigla: str) -> str:
     idx = sum(ord(c) for c in sigla) % len(palette)
     return palette[idx]
 
+
 def zone_style(feat):
-    sigla = get_prop(feat, "sigla", "SIGLA", "zona_sigla", "ZONA_SIGLA")
+    props = (feat or {}).get("properties") or {}
+    sigla = get_prop(props, "sigla", "SIGLA", "zona_sigla", "ZONA_SIGLA")
     return {
         "fillColor": color_for_zone(sigla),
         "color": "#222222",
@@ -47,104 +52,142 @@ def zone_style(feat):
         "fillOpacity": 0.35,
     }
 
+
 def ruas_style(_feat):
     return {"color": "#ff4d4d", "weight": 2, "opacity": 0.9}
 
-# ===== Criar mapa =====
-m = folium.Map(location=[-3.69, -40.35], zoom_start=13, tiles="OpenStreetMap")
-
-# ===== Camada: Zoneamento (tooltip + popup) =====
-zone_fields = ["sigla", "zona", "zona_sigla", "nome", "NOME", "SIGLA"]
-zone_aliases = ["Sigla: ", "Zona: ", "Sigla Zona: ", "Nome: ", "Nome: ", "Sigla: "]
-
-zone_layer = folium.GeoJson(
-    zoneamento,
-    name="Zoneamento",
-    style_function=zone_style,
-    highlight_function=lambda x: {"weight": 3, "color": "#000000", "fillOpacity": 0.45},
-    tooltip=folium.GeoJsonTooltip(
-        fields=zone_fields,
-        aliases=zone_aliases,
-        sticky=True,
-        labels=True,
-    ),
-    popup=folium.GeoJsonPopup(
-        fields=zone_fields,
-        aliases=zone_aliases,
-        labels=True,
-        localize=True,
-    ),
-)
-zone_layer.add_to(m)
-
-# ===== Camada: Ruas =====
-folium.GeoJson(
-    ruas,
-    name="Ruas",
-    style_function=ruas_style,
-    interactive=False,  # ruas não capturam clique
-).add_to(m)
-
-folium.LayerControl(collapsed=False).add_to(m)
-
-# =========================
-# Painel lateral (clique)
-# =========================
 
 @st.cache_data(show_spinner=False)
-def build_zone_index(zoneamento_fc):
-    """Pré-processa geometrias pra busca rápida."""
-    items = []
-    for feat in zoneamento_fc.get("features", []):
+def load_geojson(path: Path):
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+@st.cache_resource(show_spinner=False)
+def build_zone_index(zone_geojson: dict):
+    """
+    Pré-processa os polígonos do zoneamento para consulta rápida.
+    Retorna lista de (prepared_geom, props).
+    """
+    out = []
+    features = (zone_geojson or {}).get("features") or []
+    for feat in features:
         geom = feat.get("geometry")
-        props = feat.get("properties", {}) or {}
-        if geom:
-            try:
-                items.append((shape(geom), props))
-            except Exception:
-                pass
-    return items
-
-zones_idx = build_zone_index(zoneamento)
-
-def find_zone_props(lat, lon):
-    """Retorna as properties da zona que contém o ponto (lon,lat)."""
-    p = Point(lon, lat)  # atenção: Point(x=lon, y=lat)
-    for poly, props in zones_idx:
+        props = feat.get("properties") or {}
+        if not geom:
+            continue
         try:
-            if poly.contains(p):
+            shp = shape(geom)  # Polygon / MultiPolygon
+            out.append((prep(shp), shp, props))
+        except Exception:
+            # Se algum polígono vier quebrado, só ignora
+            continue
+    return out
+
+
+def find_zone_for_click(index, lat: float, lon: float):
+    """
+    Recebe lat/lon (WGS84) e retorna props do polígono que contém o ponto.
+    """
+    p = Point(lon, lat)  # shapely usa (x=lon, y=lat)
+    for prepared, original_geom, props in index:
+        try:
+            # contains pode falhar no limite; intersects pega borda também
+            if prepared.contains(p) or original_geom.intersects(p):
                 return props
         except Exception:
             continue
     return None
 
-# Render do mapa + captura do clique
-out = st_folium(m, width=1200, height=700)
 
-# Pega o clique (algumas versões retornam 'last_clicked')
-clicked = out.get("last_clicked") or out.get("last_object_clicked")
+# =============================
+# Carregar dados
+# =============================
+if not ZONE_FILE.exists():
+    st.error(f"Arquivo não encontrado: {ZONE_FILE}")
+    st.stop()
 
-st.sidebar.title("Detalhes do ponto")
-if clicked and isinstance(clicked, dict) and ("lat" in clicked and "lng" in clicked):
-    lat = clicked["lat"]
-    lon = clicked["lng"]
+zoneamento = load_geojson(ZONE_FILE)
 
-    st.sidebar.write(f"📍 Clique: **{lat:.6f}, {lon:.6f}**")
+ruas = None
+if RUAS_FILE.exists():
+    ruas = load_geojson(RUAS_FILE)
 
-    props = find_zone_props(lat, lon)
-    if props:
-        # Mostra campos mais comuns primeiro
-        sigla = props.get("sigla") or props.get("SIGLA") or props.get("zona_sigla") or props.get("ZONA_SIGLA")
-        zona  = props.get("zona")  or props.get("nome")  or props.get("NOME")
+zone_index = build_zone_index(zoneamento)
 
-        st.sidebar.subheader("Zoneamento")
-        st.sidebar.write(f"**Sigla:** {sigla if sigla else '-'}")
-        st.sidebar.write(f"**Zona:** {zona if zona else '-'}")
 
-        st.sidebar.divider()
-        st.sidebar.subheader("Propriedades (completo)")
-        st.sidebar.json(props)
-    else:
-        st.sidebar.warning("Clique dentro de um polígono de zoneamento para ver os dados.")
-else:
-    st.sidebar.info("Clique em uma zona no mapa para ver os detalhes aqui.")
+# =============================
+# Layout: mapa + painel
+# =============================
+col_map, col_panel = st.columns([3, 1], gap="large")
+
+with col_map:
+    # Mapa base
+    m = folium.Map(location=[-3.69, -40.35], zoom_start=13, tiles="OpenStreetMap")
+
+    # Camada zoneamento (visual)
+    zone_fields = ["sigla", "zona", "zona_sigla", "nome", "NOME", "SIGLA"]
+    zone_aliases = ["Sigla: ", "Zona: ", "Sigla Zona: ", "Nome: ", "Nome: ", "Sigla: "]
+
+    folium.GeoJson(
+        zoneamento,
+        name="Zoneamento",
+        style_function=zone_style,
+        highlight_function=lambda x: {"weight": 3, "color": "#000000", "fillOpacity": 0.45},
+        tooltip=folium.GeoJsonTooltip(
+            fields=zone_fields,
+            aliases=zone_aliases,
+            sticky=True,
+            labels=True,
+        ),
+    ).add_to(m)
+
+    # Camada ruas (se existir) — NÃO captura clique
+    if ruas:
+        folium.GeoJson(
+            ruas,
+            name="Ruas",
+            style_function=ruas_style,
+            interactive=False,
+        ).add_to(m)
+
+    folium.LayerControl(collapsed=False).add_to(m)
+
+    # Render e captura do clique
+    out = st_folium(m, width=1200, height=700)
+
+with col_panel:
+    st.subheader("Consulta por clique")
+
+    last = (out or {}).get("last_clicked")
+    if not last:
+        st.info("Clique em qualquer ponto dentro de Sobral para ver a zona aqui.")
+        st.stop()
+
+    lat = last.get("lat")
+    lon = last.get("lng")
+
+    st.write("**Coordenadas clicadas**")
+    st.code(f"lat: {lat:.6f}\nlon: {lon:.6f}", language="text")
+
+    props = find_zone_for_click(zone_index, lat, lon)
+
+    if not props:
+        st.warning("Não encontrei uma zona para esse ponto (talvez esteja fora do zoneamento).")
+        st.stop()
+
+    # Mostra campos mais comuns (sem depender de nomes exatos)
+    sigla = get_prop(props, "sigla", "SIGLA", "zona_sigla", "ZONA_SIGLA")
+    zona = get_prop(props, "zona", "ZONA", "nome", "NOME")
+    zona_sigla = get_prop(props, "zona_sigla", "ZONA_SIGLA")
+
+    st.success("Zona encontrada ✅")
+
+    st.write("**Sigla**:", sigla if sigla else "—")
+    st.write("**Zona**:", zona if zona else "—")
+    if zona_sigla:
+        st.write("**Sigla Zona**:", zona_sigla)
+
+    # Debug opcional: mostrar todas as properties
+    with st.expander("Ver properties completas (debug)"):
+        st.json(props)
