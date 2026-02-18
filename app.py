@@ -22,8 +22,16 @@ DATA_DIR = Path("data")
 ZONE_FILE = DATA_DIR / "zoneamento.json"
 RUAS_FILE = DATA_DIR / "ruas.json"
 
-# WGS84 -> WebMercator (metros)
 _to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True).transform
+
+
+# =============================
+# UI (opções leves)
+# =============================
+with st.sidebar:
+    st.header("Exibição")
+    SHOW_RUAS = st.checkbox("Mostrar ruas (PESADO)", value=False)
+    st.caption("Dica: deixe desmarcado para ficar rápido. O mapa base já mostra ruas.")
 
 
 # =============================
@@ -51,11 +59,17 @@ def color_for_zone(sigla: str) -> str:
 def zone_style(feat):
     props = (feat or {}).get("properties") or {}
     sigla = get_prop(props, "sigla", "SIGLA", "zona_sigla", "ZONA_SIGLA", "name")
-    return {"fillColor": color_for_zone(sigla), "color": "#222222", "weight": 1, "fillOpacity": 0.35}
+    return {
+        "fillColor": color_for_zone(sigla),
+        "color": "#222222",
+        "weight": 1,
+        "fillOpacity": 0.35,
+    }
 
 
 def ruas_style(_feat):
-    return {"color": "#ff4d4d", "weight": 2, "opacity": 0.9}
+    # Se você mostrar ruas, deixa elas mais leves
+    return {"color": "#ff4d4d", "weight": 1, "opacity": 0.7}
 
 
 @st.cache_data(show_spinner=False)
@@ -149,6 +163,7 @@ def find_zone_for_click(zone_index, lat: float, lon: float):
 
 @st.cache_resource(show_spinner=False)
 def build_ruas_index(ruas_geojson: dict):
+    # Index leve: STRtree com geoms projetadas (rápido pra nearest)
     geoms_m, props_list = [], []
     for feat in (ruas_geojson or {}).get("features") or []:
         geom = feat.get("geometry")
@@ -242,9 +257,9 @@ ruas_index = build_ruas_index(ruas) if ruas else None
 # Session state
 # =============================
 if "click" not in st.session_state:
-    st.session_state["click"] = None  # {"lat":..., "lng":...}
+    st.session_state["click"] = None
 if "result" not in st.session_state:
-    st.session_state["result"] = None  # dict com zona/rua/hierarquia
+    st.session_state["result"] = None
 if "show_popup" not in st.session_state:
     st.session_state["show_popup"] = False
 
@@ -255,29 +270,31 @@ if "show_popup" not in st.session_state:
 col_map, col_panel = st.columns([3, 1], gap="large")
 
 with col_map:
-    m = folium.Map(location=[-3.69, -40.35], zoom_start=13, tiles="OpenStreetMap")
+    # ✅ prefer_canvas melhora performance de vetores
+    m = folium.Map(
+        location=[-3.69, -40.35],
+        zoom_start=13,
+        tiles="OpenStreetMap",
+        prefer_canvas=True,
+    )
 
-    zone_aliases = ["Sigla: ", "Zona: ", "Sigla Zona: ", "Nome: ", "Nome: ", "Sigla: ", "Nome: "]
-
+    # Zoneamento (visual)
     folium.GeoJson(
         zoneamento,
         name="Zoneamento",
         style_function=zone_style,
         highlight_function=lambda x: {"weight": 3, "color": "#000000", "fillOpacity": 0.45},
-        tooltip=folium.GeoJsonTooltip(
-            fields=list(zone_fields),
-            aliases=zone_aliases,
-            sticky=True,
-            labels=True,
-        ),
+        smooth_factor=1,  # ajuda a suavizar/otimizar no Leaflet
     ).add_to(m)
 
-    if ruas:
+    # ⚠️ Ruas no mapa só se marcar (pesado)
+    if SHOW_RUAS and ruas:
         folium.GeoJson(
             ruas,
             name="Ruas",
             style_function=ruas_style,
             interactive=False,
+            smooth_factor=1,
         ).add_to(m)
 
     folium.LayerControl(collapsed=False).add_to(m)
@@ -285,7 +302,7 @@ with col_map:
     click = st.session_state["click"]
     result = st.session_state["result"]
 
-    # PIN sempre aparece se houver clique
+    # PIN aparece sempre (instantâneo)
     if click:
         lat = float(click["lat"])
         lon = float(click["lng"])
@@ -312,7 +329,7 @@ with col_map:
 
     out = st_folium(m, width=1200, height=700, key="main_map")
 
-    # ✅ Clique: só salva e rerun (pra desenhar o pin imediatamente)
+    # Clique: salva e rerun (sem calcular nada)
     last = (out or {}).get("last_clicked")
     if last:
         new_click = {"lat": float(last["lat"]), "lng": float(last["lng"])}
@@ -328,7 +345,7 @@ with col_panel:
 
     click = st.session_state["click"]
     if not click:
-        st.info("Clique em qualquer ponto no mapa. Depois clique em **Ver resultado**.")
+        st.info("Clique no mapa. Depois clique em **Ver resultado**.")
         st.stop()
 
     lat = float(click["lat"])
@@ -337,7 +354,6 @@ with col_panel:
     st.write("**Coordenadas clicadas**")
     st.code(f"lat: {lat:.6f}\nlon: {lon:.6f}", language="text")
 
-    # Botão que dispara consulta pesada
     if st.button("🔎 Ver resultado", use_container_width=True):
         props_zone = find_zone_for_click(zone_index, lat, lon)
         zona_sigla = get_prop(props_zone or {}, "sigla", "SIGLA", "zona_sigla", "ZONA_SIGLA", "name")
@@ -361,7 +377,6 @@ with col_panel:
         st.caption("Clique em **Ver resultado** para carregar zona/rua/hierarquia.")
         st.stop()
 
-    # Zona
     if result.get("zona_nome") or result.get("zona_sigla"):
         st.success("Zona encontrada ✅")
         st.write("**Sigla:**", result.get("zona_sigla") or "—")
@@ -371,14 +386,12 @@ with col_panel:
 
     st.divider()
 
-    # Rua
     if result.get("rua_nome") or result.get("hierarquia"):
         st.info("Rua mais próxima 🛣️")
         st.write("**Logradouro:**", result.get("rua_nome") or "—")
-        if result.get("hierarquia"):
-            st.write("**Hierarquia:**", result.get("hierarquia") or "—")
+        st.write("**Hierarquia:**", result.get("hierarquia") or "—")
     else:
-        st.write("**Rua mais próxima:** não encontrada (muito longe do clique).")
+        st.write("**Rua mais próxima:** não encontrada.")
 
     with st.expander("Ver resultado bruto (debug)"):
         st.json(result)
