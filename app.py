@@ -19,6 +19,10 @@ DATA_DIR = Path("data")
 ZONE_FILE = DATA_DIR / "zoneamento.json"
 RUAS_FILE = DATA_DIR / "ruas.json"
 
+# Campos que vamos tentar mostrar (tooltip)
+ZONE_FIELDS = ["sigla", "zona", "zona_sigla", "nome", "NOME", "SIGLA"]
+ZONE_ALIASES = ["Sigla: ", "Zona: ", "Sigla Zona: ", "Nome: ", "Nome: ", "Sigla: "]
+
 
 # =============================
 # Utils
@@ -57,6 +61,23 @@ def ruas_style(_feat):
     return {"color": "#ff4d4d", "weight": 2, "opacity": 0.9}
 
 
+def ensure_fields_in_properties(geojson: dict, fields: list[str]) -> dict:
+    """
+    Evita AssertionError do Folium:
+    garante que todas as features tenham todas as chaves do tooltip.
+    """
+    feats = (geojson or {}).get("features") or []
+    for feat in feats:
+        props = feat.get("properties")
+        if props is None:
+            props = {}
+            feat["properties"] = props
+        for f in fields:
+            if f not in props:
+                props[f] = ""
+    return geojson
+
+
 @st.cache_data(show_spinner=False)
 def load_geojson(path: Path):
     with path.open("r", encoding="utf-8") as f:
@@ -65,10 +86,6 @@ def load_geojson(path: Path):
 
 @st.cache_resource(show_spinner=False)
 def build_zone_index(zone_geojson: dict):
-    """
-    Pré-processa os polígonos do zoneamento para consulta rápida.
-    Retorna lista de (prepared_geom, props).
-    """
     out = []
     features = (zone_geojson or {}).get("features") or []
     for feat in features:
@@ -77,22 +94,17 @@ def build_zone_index(zone_geojson: dict):
         if not geom:
             continue
         try:
-            shp = shape(geom)  # Polygon / MultiPolygon
+            shp = shape(geom)
             out.append((prep(shp), shp, props))
         except Exception:
-            # Se algum polígono vier quebrado, só ignora
             continue
     return out
 
 
 def find_zone_for_click(index, lat: float, lon: float):
-    """
-    Recebe lat/lon (WGS84) e retorna props do polígono que contém o ponto.
-    """
-    p = Point(lon, lat)  # shapely usa (x=lon, y=lat)
+    p = Point(lon, lat)
     for prepared, original_geom, props in index:
         try:
-            # contains pode falhar no limite; intersects pega borda também
             if prepared.contains(p) or original_geom.intersects(p):
                 return props
         except Exception:
@@ -108,6 +120,7 @@ if not ZONE_FILE.exists():
     st.stop()
 
 zoneamento = load_geojson(ZONE_FILE)
+zoneamento = ensure_fields_in_properties(zoneamento, ZONE_FIELDS)  # <-- FIX DO ERRO
 
 ruas = None
 if RUAS_FILE.exists():
@@ -122,27 +135,23 @@ zone_index = build_zone_index(zoneamento)
 col_map, col_panel = st.columns([3, 1], gap="large")
 
 with col_map:
-    # Mapa base
     m = folium.Map(location=[-3.69, -40.35], zoom_start=13, tiles="OpenStreetMap")
 
-    # Camada zoneamento (visual)
-    zone_fields = ["sigla", "zona", "zona_sigla", "nome", "NOME", "SIGLA"]
-    zone_aliases = ["Sigla: ", "Zona: ", "Sigla Zona: ", "Nome: ", "Nome: ", "Sigla: "]
-
+    # Zoneamento com tooltip (agora não quebra)
     folium.GeoJson(
         zoneamento,
         name="Zoneamento",
         style_function=zone_style,
         highlight_function=lambda x: {"weight": 3, "color": "#000000", "fillOpacity": 0.45},
         tooltip=folium.GeoJsonTooltip(
-            fields=zone_fields,
-            aliases=zone_aliases,
+            fields=ZONE_FIELDS,
+            aliases=ZONE_ALIASES,
             sticky=True,
             labels=True,
         ),
     ).add_to(m)
 
-    # Camada ruas (se existir) — NÃO captura clique
+    # Ruas (não captura clique)
     if ruas:
         folium.GeoJson(
             ruas,
@@ -176,18 +185,15 @@ with col_panel:
         st.warning("Não encontrei uma zona para esse ponto (talvez esteja fora do zoneamento).")
         st.stop()
 
-    # Mostra campos mais comuns (sem depender de nomes exatos)
     sigla = get_prop(props, "sigla", "SIGLA", "zona_sigla", "ZONA_SIGLA")
     zona = get_prop(props, "zona", "ZONA", "nome", "NOME")
     zona_sigla = get_prop(props, "zona_sigla", "ZONA_SIGLA")
 
     st.success("Zona encontrada ✅")
-
     st.write("**Sigla**:", sigla if sigla else "—")
     st.write("**Zona**:", zona if zona else "—")
     if zona_sigla:
         st.write("**Sigla Zona**:", zona_sigla)
 
-    # Debug opcional: mostrar todas as properties
     with st.expander("Ver properties completas (debug)"):
         st.json(props)
