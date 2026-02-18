@@ -51,7 +51,12 @@ def color_for_zone(sigla: str) -> str:
 def zone_style(feat):
     props = (feat or {}).get("properties") or {}
     sigla = get_prop(props, "sigla", "SIGLA", "zona_sigla", "ZONA_SIGLA", "name")
-    return {"fillColor": color_for_zone(sigla), "color": "#222222", "weight": 1, "fillOpacity": 0.35}
+    return {
+        "fillColor": color_for_zone(sigla),
+        "color": "#222222",
+        "weight": 1,
+        "fillOpacity": 0.35,
+    }
 
 
 def ruas_style(_feat):
@@ -66,7 +71,10 @@ def load_geojson(path: Path):
 
 @st.cache_resource(show_spinner=False)
 def ensure_properties_keys_cached(zoneamento: dict, keys: tuple[str, ...]) -> dict:
-    # Faz uma cópia "suficiente" para evitar mutar cache externo
+    """
+    Evita AssertionError do folium tooltip: garante que todo mundo tenha as chaves.
+    Faz cópia via JSON para não mutar o cache original.
+    """
     z = json.loads(json.dumps(zoneamento))
     feats = (z or {}).get("features") or []
     for feat in feats:
@@ -81,13 +89,17 @@ def ensure_properties_keys_cached(zoneamento: dict, keys: tuple[str, ...]) -> di
 
 
 def _tree_returns_indices(res) -> bool:
-    # Shapely 2 geralmente retorna índices (np.int64) — checa de forma robusta
+    """
+    Detecta se STRtree retornou índices (int, numpy.int64 etc).
+    A forma mais segura é tentar converter o primeiro item pra int.
+    """
     if res is None:
         return False
     try:
         if len(res) == 0:
             return True
-        return isinstance(res[0], (int,))
+        _ = int(res[0])  # funciona para int e numpy.int64
+        return True
     except Exception:
         return False
 
@@ -120,29 +132,36 @@ def build_zone_index(zone_geojson: dict):
 
 
 def find_zone_for_click(zone_index, lat: float, lon: float):
+    """
+    Retorna properties do polígono que contém o clique.
+    Compatível com Shapely que retorna índices (int/numpy.int64) ou geometrias.
+    """
     p = Point(lon, lat)
     tree = zone_index["tree"]
     if not tree:
         return None
 
-    # candidates pode ser "índices" (Shapely 2) ou "geometrias" (alguns casos)
     candidates = tree.query(p)
+
     geoms = zone_index["geoms"]
     preps_list = zone_index["preps"]
     props_list = zone_index["props"]
+    n = len(geoms)
 
-    # Caso 1: retornou índices
+    # Caminho rápido: candidatos como índices
     if _tree_returns_indices(candidates):
-        for i in candidates:
+        for raw in candidates:
             try:
-                i = int(i)
+                i = int(raw)
+                if i < 0 or i >= n:
+                    continue
                 if preps_list[i].contains(p) or geoms[i].intersects(p):
                     return props_list[i]
             except Exception:
                 continue
         return None
 
-    # Caso 2: retornou geometrias -> resolve pelo índice na lista (mais lento, mas seguro)
+    # Fallback: se vier geometria
     for g in candidates:
         try:
             i = geoms.index(g)
@@ -150,6 +169,7 @@ def find_zone_for_click(zone_index, lat: float, lon: float):
                 return props_list[i]
         except Exception:
             continue
+
     return None
 
 
@@ -157,6 +177,7 @@ def find_zone_for_click(zone_index, lat: float, lon: float):
 def build_ruas_index(ruas_geojson: dict):
     """
     Projeta ruas para 3857 UMA vez e cria STRtree.
+    Guarda geoms_m (em metros) + props.
     """
     geoms_m, props_list = [], []
     for feat in (ruas_geojson or {}).get("features") or []:
@@ -165,8 +186,8 @@ def build_ruas_index(ruas_geojson: dict):
         if not geom:
             continue
         try:
-            g = shape(geom)                 # WGS84
-            g_m = transform(_to_3857, g)     # metros
+            g = shape(geom)              # WGS84
+            g_m = transform(_to_3857, g)  # metros
             geoms_m.append(g_m)
             props_list.append(props)
         except Exception:
@@ -177,6 +198,10 @@ def build_ruas_index(ruas_geojson: dict):
 
 
 def find_nearest_street(ruas_index, lat: float, lon: float, max_dist_m: float = 80.0):
+    """
+    Rua mais próxima (por distância em metros) usando STRtree.
+    Compatível com Shapely que retorna índice (int/numpy.int64) ou geometria.
+    """
     if not ruas_index or not ruas_index["tree"]:
         return None, None
 
@@ -184,21 +209,25 @@ def find_nearest_street(ruas_index, lat: float, lon: float, max_dist_m: float = 
     tree = ruas_index["tree"]
     geoms_m = ruas_index["geoms_m"]
     props_list = ruas_index["props"]
+    n = len(geoms_m)
 
-    # nearest pode retornar índice (Shapely 2) ou geometria
     try:
         nearest = tree.nearest(p_m)
         if nearest is None:
             return None, None
 
-        if isinstance(nearest, (int,)):
+        # Se vier índice (int/numpy.int64)
+        try:
             i = int(nearest)
-            d = p_m.distance(geoms_m[i])
-            if d > max_dist_m:
+            if 0 <= i < n:
+                d = p_m.distance(geoms_m[i])
+                if d <= max_dist_m:
+                    return props_list[i], d
                 return None, None
-            return props_list[i], d
+        except Exception:
+            pass
 
-        # se vier geometria:
+        # Se vier geometria
         g = nearest
         d = p_m.distance(g)
         if d > max_dist_m:
