@@ -51,46 +51,28 @@ def ruas_style(_feat):
 # ===== Criar mapa =====
 m = folium.Map(location=[-3.69, -40.35], zoom_start=13, tiles="OpenStreetMap")
 
-# ===== Camada: Zoneamento (com tooltip e popup) =====
-# Descobre quais campos existem no GeoJSON
-props0 = (zoneamento.get("features", [{}])[0] or {}).get("properties", {}) or {}
-
-campos_desejados = ["sigla", "SIGLA", "zona", "zona_sigla", "ZONA_SIGLA", "nome", "NOME"]
-campos_ok = [c for c in campos_desejados if c in props0]
-
-aliases_map = {
-    "sigla": "Sigla: ",
-    "SIGLA": "Sigla: ",
-    "zona": "Zona: ",
-    "zona_sigla": "Sigla Zona: ",
-    "ZONA_SIGLA": "Sigla Zona: ",
-    "nome": "Nome: ",
-    "NOME": "Nome: ",
-}
-aliases_ok = [aliases_map.get(c, f"{c}: ") for c in campos_ok]
+# ===== Camada: Zoneamento (tooltip + popup) =====
+zone_fields = ["sigla", "zona", "zona_sigla", "nome", "NOME", "SIGLA"]
+zone_aliases = ["Sigla: ", "Zona: ", "Sigla Zona: ", "Nome: ", "Nome: ", "Sigla: "]
 
 zone_layer = folium.GeoJson(
     zoneamento,
     name="Zoneamento",
     style_function=zone_style,
     highlight_function=lambda x: {"weight": 3, "color": "#000000", "fillOpacity": 0.45},
-)
-
-if campos_ok:
-    folium.GeoJsonTooltip(
-        fields=campos_ok,
-        aliases=aliases_ok,
-        localize=True,
+    tooltip=folium.GeoJsonTooltip(
+        fields=zone_fields,
+        aliases=zone_aliases,
         sticky=True,
         labels=True,
-    ).add_to(zone_layer)
-
-    folium.GeoJsonPopup(
-        fields=campos_ok,
-        aliases=aliases_ok,
-        localize=True,
+    ),
+    popup=folium.GeoJsonPopup(
+        fields=zone_fields,
+        aliases=zone_aliases,
         labels=True,
-    ).add_to(zone_layer)
+        localize=True,
+    ),
+)
 
 zone_layer.add_to(m)
 
