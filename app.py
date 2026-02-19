@@ -2,6 +2,7 @@ import os
 import json
 from pathlib import Path
 from typing import Optional, Dict, Any
+from numbers import Integral
 
 import streamlit as st
 import folium
@@ -35,7 +36,6 @@ _to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True).transf
 @st.cache_resource(show_spinner=False)
 def get_supabase():
     url = st.secrets.get("SUPABASE_URL") or os.getenv("SUPABASE_URL")
-    # OBS: seu "anon key" virou "Publishable Key" no painel, mas no código continua sendo a mesma chave pública
     key = st.secrets.get("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_ANON_KEY")
     if not url or not key:
         return None
@@ -142,6 +142,18 @@ def fmt_m2(x: Optional[float]) -> str:
         return "—"
 
 
+def _tree_returns_indices(candidates) -> bool:
+    """Shapely 2 pode retornar índices (int / numpy.int64)."""
+    try:
+        if candidates is None:
+            return False
+        if len(candidates) == 0:
+            return True
+        return isinstance(candidates[0], Integral)
+    except Exception:
+        return False
+
+
 # =============================
 # GeoJSON load / indexes
 # =============================
@@ -151,19 +163,9 @@ def load_geojson(path: Path):
         return json.load(f)
 
 
-# ---------- ZONEAMENTO (FIX DEFINITIVO: NÃO USAR id()) ----------
 @st.cache_resource(show_spinner=False)
 def build_zone_index(zone_geojson: dict):
-    """
-    Índice robusto:
-    - STRtree para reduzir candidatos
-    - NÃO usa id(g) (STRtree pode devolver clones)
-    - mapeia WKB -> índice (estável)
-    """
-    geoms: list = []
-    props_list: list = []
-    wkb_to_idx: dict = {}
-
+    geoms, props_list = [], []
     for feat in (zone_geojson or {}).get("features") or []:
         geom = feat.get("geometry")
         props = feat.get("properties") or {}
@@ -176,15 +178,8 @@ def build_zone_index(zone_geojson: dict):
         except Exception:
             continue
 
-    # chave estável: bytes WKB
-    for i, g in enumerate(geoms):
-        try:
-            wkb_to_idx[g.wkb] = i
-        except Exception:
-            pass
-
     tree = STRtree(geoms) if geoms else None
-    return {"geoms": geoms, "props": props_list, "tree": tree, "wkb_to_idx": wkb_to_idx}
+    return {"geoms": geoms, "props": props_list, "tree": tree}
 
 
 def find_zone_for_click(zone_index, lat: float, lon: float):
@@ -201,21 +196,28 @@ def find_zone_for_click(zone_index, lat: float, lon: float):
 
     geoms = zone_index["geoms"]
     props_list = zone_index["props"]
-    wkb_to_idx = zone_index.get("wkb_to_idx") or {}
 
+    # Caso A: query retorna índices
+    if _tree_returns_indices(candidates):
+        for i in candidates:
+            try:
+                idx = int(i)
+                g = geoms[idx]
+                if g.contains(p) or g.intersects(p):
+                    return props_list[idx]
+            except Exception:
+                continue
+        return None
+
+    # Caso B: query retorna geometrias
     for g in candidates:
         try:
             if g.contains(p) or g.intersects(p):
-                # resolve índice por WKB (estável)
-                i = wkb_to_idx.get(g.wkb)
-                if i is not None:
-                    return props_list[i]
-
-                # fallback (mais lento, mas só em casos raros)
                 try:
-                    i2 = geoms.index(g)
-                    return props_list[i2]
+                    idx = geoms.index(g)
+                    return props_list[idx]
                 except Exception:
+                    # fallback: ainda assim retorna pelo 1º match
                     return None
         except Exception:
             continue
@@ -223,19 +225,9 @@ def find_zone_for_click(zone_index, lat: float, lon: float):
     return None
 
 
-# ---------- RUAS (FIX SEM id()) ----------
 @st.cache_resource(show_spinner=False)
 def build_ruas_index(ruas_geojson: dict):
-    """
-    Índice robusto para ruas:
-    - projeta para 3857 uma vez
-    - STRtree para nearest
-    - mapeia WKB -> índice (estável)
-    """
-    geoms_m: list = []
-    props_list: list = []
-    wkb_to_idx: dict = {}
-
+    geoms_m, props_list = [], []
     for feat in (ruas_geojson or {}).get("features") or []:
         geom = feat.get("geometry")
         props = feat.get("properties") or {}
@@ -249,14 +241,8 @@ def build_ruas_index(ruas_geojson: dict):
         except Exception:
             continue
 
-    for i, g in enumerate(geoms_m):
-        try:
-            wkb_to_idx[g.wkb] = i
-        except Exception:
-            pass
-
     tree = STRtree(geoms_m) if geoms_m else None
-    return {"geoms_m": geoms_m, "props": props_list, "tree": tree, "wkb_to_idx": wkb_to_idx}
+    return {"geoms_m": geoms_m, "props": props_list, "tree": tree}
 
 
 def find_nearest_street(ruas_index, lat: float, lon: float, max_dist_m: float = 120.0):
@@ -267,27 +253,31 @@ def find_nearest_street(ruas_index, lat: float, lon: float, max_dist_m: float = 
     tree = ruas_index["tree"]
     geoms_m = ruas_index["geoms_m"]
     props_list = ruas_index["props"]
-    wkb_to_idx = ruas_index.get("wkb_to_idx") or {}
 
     try:
-        nearest_geom = tree.nearest(p_m)
-        if nearest_geom is None:
+        nearest = tree.nearest(p_m)
+        if nearest is None:
             return None
 
-        d = p_m.distance(nearest_geom)
+        # Caso A: nearest retorna índice
+        if isinstance(nearest, Integral):
+            idx = int(nearest)
+            d = p_m.distance(geoms_m[idx])
+            if d > max_dist_m:
+                return None
+            return props_list[idx]
+
+        # Caso B: nearest retorna geometria
+        g = nearest
+        d = p_m.distance(g)
         if d > max_dist_m:
             return None
-
-        i = wkb_to_idx.get(nearest_geom.wkb)
-        if i is not None:
-            return props_list[i]
-
-        # fallback raro
         try:
-            i2 = geoms_m.index(nearest_geom)
-            return props_list[i2]
+            idx = geoms_m.index(g)
+            return props_list[idx]
         except Exception:
             return None
+
     except Exception:
         return None
 
@@ -547,7 +537,6 @@ with col_panel:
             if metric == "fixed":
                 vagas = int(value)
             elif metric == "per_unit":
-                # sem "unidades" ainda no MVP -> assume 1 unidade p/ RES_UNI
                 if use_code == "RES_UNI":
                     vagas = max(int(value), int(min_v or 0))
                 else:
