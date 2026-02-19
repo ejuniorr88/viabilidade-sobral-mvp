@@ -2,6 +2,7 @@ import os
 import json
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
+from numbers import Integral  # ✅ pega int e numpy.int64
 
 import streamlit as st
 import folium
@@ -181,14 +182,18 @@ def load_geojson(path: Path):
         return json.load(f)
 
 
+def _is_index(x) -> bool:
+    # ✅ cobre int, numpy.int64, etc.
+    return isinstance(x, Integral)
+
+
 def _tree_returns_indices(res) -> bool:
-    """Shapely 2 geralmente retorna índices (np.int64)."""
     if res is None:
         return False
     try:
         if len(res) == 0:
             return True
-        return isinstance(res[0], (int,))
+        return _is_index(res[0])
     except Exception:
         return False
 
@@ -226,7 +231,7 @@ def find_zone_for_click(zone_index, lat: float, lon: float):
     props_list = zone_index["props"]
     gid = zone_index["gid"]
 
-    # Caso 1: índices
+    # Caso 1: índices (Shapely 2)
     if _tree_returns_indices(candidates):
         for i in candidates:
             try:
@@ -237,7 +242,7 @@ def find_zone_for_click(zone_index, lat: float, lon: float):
                 continue
         return None
 
-    # Caso 2: geometrias
+    # Caso 2: geometrias (Shapely 1.x)
     for g in candidates:
         i = gid.get(id(g))
         if i is None:
@@ -286,15 +291,15 @@ def find_nearest_street(ruas_index, lat: float, lon: float, max_dist_m: float = 
         if nearest is None:
             return None
 
-        # Shapely 2 pode retornar índice
-        if isinstance(nearest, (int,)):
+        # ✅ Shapely 2 pode retornar índice (np.int64)
+        if _is_index(nearest):
             i = int(nearest)
             d = p_m.distance(geoms_m[i])
             if d > max_dist_m:
                 return None
             return props_list[i]
 
-        # ou geometria
+        # Shapely 1.x retorna geometria
         g = nearest
         d = p_m.distance(g)
         if d > max_dist_m:
@@ -375,14 +380,12 @@ def sb_get_parking_rule(use_type_code: str) -> Optional[Dict[str, Any]]:
 # Cálculos urbanísticos (MVP)
 # =============================
 def estimate_pavimentos(gabarito_pav: Optional[int], gabarito_m: Optional[float]) -> Optional[int]:
-    # Se vier pavimentos oficial, usa.
     try:
         if gabarito_pav not in (None, "", 0):
             return int(gabarito_pav)
     except Exception:
         pass
 
-    # Se só vier metros, estima (bem simplificado) usando 3,0m/pav.
     try:
         if gabarito_m is None:
             return None
@@ -428,7 +431,6 @@ def compute_urbanism(
         g_m = rule.get("gabarito_m")
         g_pav = rule.get("gabarito_pav")
 
-        # áreas por índices
         calc["to_max"] = to_max
         calc["tp_min"] = tp_min
         calc["ia_max"] = ia_max
@@ -437,7 +439,6 @@ def compute_urbanism(
         calc["area_min_permeavel"] = (float(tp_min) * area_lote) if tp_min is not None else None
         calc["area_max_total_construida"] = (float(ia_max) * area_lote) if ia_max is not None else None
 
-        # recuos
         calc["recuo_frontal_m"] = rec_fr
         calc["recuo_lateral_m"] = rec_lat
         calc["recuo_fundos_m"] = rec_fun
@@ -446,28 +447,26 @@ def compute_urbanism(
         calc["observacoes"] = rule.get("observacoes")
         calc["source_ref"] = rule.get("source_ref")
 
-        # miolo por recuos (retângulo útil)
+        # miolo (recuos)
         if rec_lat is not None and rec_fr is not None and rec_fun is not None:
-            largura_util = float(testada) - (2.0 * float(rec_lat))
-            prof_util = float(profundidade) - float(rec_fr) - float(rec_fun)
-            largura_util = max(largura_util, 0.0)
-            prof_util = max(prof_util, 0.0)
+            largura_util = max(float(testada) - (2.0 * float(rec_lat)), 0.0)
+            prof_util = max(float(profundidade) - float(rec_fr) - float(rec_fun), 0.0)
             area_miolo = largura_util * prof_util
         else:
+            largura_util = None
+            prof_util = None
             area_miolo = None
 
-        calc["largura_util_miolo"] = None if rec_lat is None else max(float(testada) - (2.0 * float(rec_lat)), 0.0)
-        calc["prof_util_miolo"] = None if (rec_fr is None or rec_fun is None) else max(float(profundidade) - float(rec_fr) - float(rec_fun), 0.0)
+        calc["largura_util_miolo"] = largura_util
+        calc["prof_util_miolo"] = prof_util
         calc["area_miolo"] = area_miolo
 
-        # térreo "real": menor entre TO e miolo (quando ambos existirem)
         area_to = calc.get("area_max_ocupacao_to")
         if area_to is not None and area_miolo is not None:
             calc["area_max_ocupacao_real"] = min(float(area_to), float(area_miolo))
         else:
             calc["area_max_ocupacao_real"] = area_to if area_to is not None else area_miolo
 
-        # estimativa de pavimentos
         calc["pavimentos_estimados"] = estimate_pavimentos(g_pav, g_m)
 
     # vagas (MVP)
@@ -482,16 +481,12 @@ def compute_urbanism(
             except Exception:
                 vagas = None
         elif metric == "per_unit":
-            # MVP: sem "unidades". RES_UNI assume 1 unidade.
             if use_code == "RES_UNI":
                 try:
                     vagas = max(int(value), int(min_v or 0))
                 except Exception:
                     vagas = None
-            else:
-                vagas = None
         elif metric == "per_area":
-            # value = vagas por m² (ex 1/50 = 0.02)
             try:
                 vagas = int((area_lote * float(value)) // 1)
                 if min_v is not None:
@@ -564,7 +559,6 @@ with col_map:
             popup=folium.Popup(html, max_width=420, show=True),
             icon=folium.Icon(color="blue", icon="info-sign"),
         ).add_to(m)
-
         m.location = [lat, lon]
         m.zoom_start = 16
 
@@ -595,11 +589,9 @@ with col_panel:
 
     st.subheader("2) Dados do lote/projeto")
 
-    # Uso (do Supabase) – filtra residencial
     use_types = sb_list_use_types()
     use_options = {u["label"]: u["code"] for u in use_types if u.get("category") == "Residencial"}
 
-    # fallback se não vier nada
     if not use_options:
         use_options = {
             "Residencial Unifamiliar (Casa)": "RES_UNI",
@@ -617,7 +609,6 @@ with col_panel:
 
     if st.button("🧮 Calcular", use_container_width=True):
         with st.spinner("Calculando..."):
-            # Localização (zona/rua) só aqui, para ficar leve
             res = compute_location(zone_index, ruas_index, lat, lon)
             st.session_state["res"] = res
 
@@ -655,7 +646,6 @@ if not res or not calc:
     st.caption("Clique no mapa, preencha os dados e depois clique em **Calcular** para ver os resultados aqui embaixo.")
     st.stop()
 
-# Linha 1: resumo (Localização / Via / Lote-Uso)
 c1, c2, c3 = st.columns(3)
 
 with c1:
@@ -705,7 +695,6 @@ with c3:
         unsafe_allow_html=True,
     )
 
-# Se não achou zona, mostra e para
 if not (res.get("zona_sigla") or res.get("zona_nome")):
     st.warning("Não encontrei zona para esse ponto (verifique se clicou dentro do município/zoneamento).")
     with st.expander("Debug (raw)"):
@@ -713,7 +702,6 @@ if not (res.get("zona_sigla") or res.get("zona_nome")):
         st.json(res.get("raw_zone") or {})
     st.stop()
 
-# Se não tem regra no Supabase, avisa
 rule = calc.get("rule")
 if not rule:
     st.warning(f"Sem regra cadastrada no Supabase para **{calc.get('zona_sigla')} + {calc.get('use_code')}**.")
@@ -723,7 +711,6 @@ if not rule:
 st.divider()
 st.markdown("## Resumo do que você pode fazer (modo simples)")
 
-# Frases leigo-friendly (EXATAMENTE no estilo que você pediu)
 area_terreo = calc.get("area_max_ocupacao_real")
 area_total = calc.get("area_max_total_construida")
 area_perm = calc.get("area_min_permeavel")
@@ -732,7 +719,6 @@ pavs = calc.get("pavimentos_estimados")
 g_pav = calc.get("gabarito_pav")
 g_m = calc.get("gabarito_m")
 
-# Card 1: térreo
 st.markdown(
     f"""
     <div class="card">
@@ -744,7 +730,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Card 2: permeável
 st.markdown(
     f"""
     <div class="card" style="margin-top:12px;">
@@ -756,10 +741,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Card 3: total construído (IA)
 total_txt = fmt_m2(area_total)
 pav_txt = f"{pavs} pavimentos (estimativa)" if pavs is not None else "—"
-altura_txt = ""
 if g_pav not in (None, "", 0):
     altura_txt = f"Limite de altura: até {g_pav} pavimentos (pela regra)."
 elif g_m is not None:
@@ -778,7 +761,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Comparação TO x miolo (explicação simples)
 st.divider()
 st.markdown("### Por que o térreo ficou nesse valor?")
 
@@ -827,7 +809,6 @@ if area_to is not None and area_miolo is not None:
 else:
     st.caption("➡️ Para comparar TO x miolo, é preciso ter TO e recuos cadastrados nessa regra.")
 
-# Vagas
 if calc.get("vagas_min") is not None:
     st.divider()
     st.markdown("## Vagas mínimas")
@@ -842,7 +823,6 @@ if calc.get("vagas_min") is not None:
         unsafe_allow_html=True,
     )
 
-# Observações / Fonte
 if calc.get("observacoes"):
     st.divider()
     st.markdown("## Observações")
