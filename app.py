@@ -630,6 +630,75 @@ rule = calc.get("rule")
 if not calc.get("zona_sigla"):
     st.warning("Não consegui identificar a sigla da zona nesse ponto. Verifique se o ponto está dentro do zoneamento.")
     st.stop()
+    st.divider()
+st.markdown("## Resumo do que você pode fazer (modo simples)")
+
+area_lote = calc.get("area_lote")
+area_to = calc.get("area_max_ocupacao_to")              # TO x lote
+area_miolo = calc.get("area_miolo")                     # miolo por recuos
+area_terreo = calc.get("area_max_ocupacao_real")        # menor entre TO e miolo
+area_total = calc.get("area_max_total_construida")      # IA x lote
+area_perm = calc.get("area_min_permeavel")              # TP x lote
+pavs = calc.get("pavimentos_estimados")
+
+# Proteções (caso algo venha None)
+area_lote_txt = fmt_m2(area_lote)
+area_terreo_txt = fmt_m2(area_terreo)
+area_total_txt = fmt_m2(area_total)
+area_perm_txt = fmt_m2(area_perm)
+
+# Frases simples
+st.success(f"✅ No térreo, você pode ocupar até **{area_terreo_txt}**.")
+
+# total construído (IA)
+if area_total is not None:
+    if pavs is not None and pavs > 0 and area_terreo is not None:
+        # só uma estimativa amigável; não é regra oficial, é “leitura” do limite
+        area_media_por_pav = area_total / pavs
+        st.info(
+            f"🏗️ No total (somando pavimentos), você pode construir até **{area_total_txt}**.\n\n"
+            f"📌 Isso dá uma média de **{fmt_m2(area_media_por_pav)} por pavimento** (estimativa)."
+        )
+    else:
+        st.info(f"🏗️ No total (somando pavimentos), você pode construir até **{area_total_txt}**.")
+else:
+    st.warning("🏗️ Não foi possível calcular o total construído (IA não cadastrado para essa regra).")
+
+# permeável
+if area_perm is not None:
+    st.warning(f"🌿 Você precisa deixar pelo menos **{area_perm_txt}** de área permeável.")
+else:
+    st.warning("🌿 Não foi possível calcular a área permeável (TP não cadastrado para essa regra).")
+
+# Pavimentos (explicação simples)
+if calc.get("gabarito_pav") not in (None, "", 0):
+    st.write(f"🏢 **Limite de altura:** até **{calc.get('gabarito_pav')} pavimentos** (pela regra).")
+elif calc.get("gabarito_m") is not None:
+    st.write(
+        f"🏢 **Limite de altura:** até **{fmt_m(calc.get('gabarito_m'))}** "
+        f"(estimamos **{pavs if pavs is not None else '—'} pavimentos**)."
+    )
+else:
+    st.caption("🏢 Altura/gabarito ainda não cadastrado para essa regra.")
+
+# Mostra “por que” o térreo deu aquele número (bem didático)
+st.divider()
+st.markdown("### Como cheguei no limite do térreo (bem simples)")
+
+colA, colB = st.columns(2)
+with colA:
+    st.write("**Limite por TO (taxa de ocupação):**", fmt_m2(area_to))
+with colB:
+    st.write("**Limite por recuos (miolo):**", fmt_m2(area_miolo) if area_miolo is not None else "—")
+
+if area_to is not None and area_miolo is not None:
+    if area_miolo < area_to:
+        st.caption("➡️ O que manda aqui são os **recuos**, porque o miolo ficou menor que o limite por TO.")
+    else:
+        st.caption("➡️ O que manda aqui é a **TO**, porque ela ficou menor (mais restritiva) que o miolo.")
+else:
+    st.caption("➡️ Para comparar TO x miolo, precisa ter TO e recuos completos cadastrados.")
+
 
 if not rule:
     st.warning(f"Sem regra cadastrada no Supabase para **{calc.get('zona_sigla')} + {calc.get('use_code')}**.")
