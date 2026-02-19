@@ -1,7 +1,7 @@
 import os
 import json
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple, Union
+from typing import Optional, Dict, Any, Tuple
 
 import streamlit as st
 import folium
@@ -29,8 +29,35 @@ RUAS_FILE = DATA_DIR / "ruas.json"
 # WGS84 -> WebMercator (metros) (só para proximidade de ruas)
 _to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True).transform
 
-# parâmetro para estimar pavimentos quando só tiver gabarito em metros
-ALTURA_PAV_ESTIMADA_M = 3.0
+
+# =============================
+# Style (cards simples)
+# =============================
+st.markdown(
+    """
+    <style>
+      .card {
+        border: 1px solid rgba(49, 51, 63, 0.12);
+        border-radius: 14px;
+        padding: 14px 16px;
+        background: white;
+      }
+      .card h4 { margin: 0 0 8px 0; font-size: 16px; }
+      .muted { color: rgba(49, 51, 63, 0.65); font-size: 13px; }
+      .big { font-size: 20px; font-weight: 700; margin: 6px 0 2px 0; }
+      .pill {
+        display: inline-block;
+        padding: 4px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        background: rgba(0, 174, 239, 0.10);
+        color: rgba(0, 95, 130, 1.0);
+        margin-bottom: 8px;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 # =============================
@@ -52,46 +79,7 @@ if sb is None:
 
 
 # =============================
-# Utils (format)
-# =============================
-def fmt_pct(x: Optional[float]) -> str:
-    if x is None:
-        return "—"
-    try:
-        return f"{float(x)*100:.0f}%"
-    except Exception:
-        return "—"
-
-
-def fmt_m(x: Optional[float]) -> str:
-    if x is None:
-        return "—"
-    try:
-        return f"{float(x):.2f} m"
-    except Exception:
-        return "—"
-
-
-def fmt_m2(x: Optional[float]) -> str:
-    if x is None:
-        return "—"
-    try:
-        return f"{float(x):.2f} m²"
-    except Exception:
-        return "—"
-
-
-def safe_float(x) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-
-# =============================
-# GeoJSON helpers
+# Utils
 # =============================
 def get_prop(props: dict, *keys) -> str:
     props = props or {}
@@ -118,7 +106,7 @@ def zone_style(feat):
     return {"fillColor": color_for_zone(sigla), "color": "#222222", "weight": 1, "fillOpacity": 0.30}
 
 
-def ensure_properties_keys(geojson: dict, keys: tuple[str, ...]) -> dict:
+def ensure_properties_keys(geojson: dict, keys: Tuple[str, ...]) -> dict:
     """Evita erro de tooltip do folium (garante que todos tenham as chaves)."""
     z = json.loads(json.dumps(geojson))  # cópia segura
     feats = (z or {}).get("features") or []
@@ -131,42 +119,76 @@ def ensure_properties_keys(geojson: dict, keys: tuple[str, ...]) -> dict:
     return z
 
 
-def popup_html(clicked: bool):
-    if not clicked:
+def fmt_pct(x: Optional[float]) -> str:
+    if x is None:
+        return "—"
+    try:
+        return f"{float(x) * 100:.0f}%"
+    except Exception:
+        return "—"
+
+
+def fmt_m(x: Optional[float]) -> str:
+    if x is None:
+        return "—"
+    try:
+        return f"{float(x):.2f} m"
+    except Exception:
+        return "—"
+
+
+def fmt_m2(x: Optional[float]) -> str:
+    if x is None:
+        return "—"
+    try:
+        return f"{float(x):.2f} m²"
+    except Exception:
+        return "—"
+
+
+def popup_html(result: dict | None):
+    if not result:
         return """
         <div style="font-family: Arial, sans-serif; font-size: 13px; line-height: 1.35; min-width:260px;">
-          <div style="font-weight:700; font-size:14px; margin-bottom:6px;">Selecione um ponto</div>
-          <div style="color:#666;">Clique no mapa para marcar o lote.</div>
+          <div style="font-weight:700; font-size:14px; margin-bottom:6px;">Ponto selecionado</div>
+          <div style="color:#666;">Preencha os dados e clique em <b>Calcular</b> para ver zona, rua e índices.</div>
         </div>
         """
-    return """
+
+    zona_nome = result.get("zona_nome") or "—"
+    zona_sigla = result.get("zona_sigla") or "—"
+    rua_nome = result.get("rua_nome") or "—"
+    hierarquia = result.get("hierarquia") or "—"
+
+    return f"""
     <div style="font-family: Arial, sans-serif; font-size: 13px; line-height: 1.35; min-width:260px;">
-      <div style="font-weight:700; font-size:14px; margin-bottom:6px;">Ponto selecionado</div>
-      <div style="color:#666;">Preencha os dados ao lado e clique em <b>Calcular</b>.</div>
+      <div style="font-weight:700; font-size:14px; margin-bottom:6px;">Consulta do ponto</div>
+      <div><b>Zona:</b> {zona_nome}</div>
+      <div><b>Sigla:</b> {zona_sigla}</div>
+      <hr style="margin:8px 0;" />
+      <div><b>Rua:</b> {rua_nome}</div>
+      <div><b>Hierarquia:</b> {hierarquia}</div>
     </div>
     """
 
 
+# =============================
+# GeoJSON load / indexes
+# =============================
 @st.cache_data(show_spinner=False)
 def load_geojson(path: Path):
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def _candidates_are_indices(cands) -> bool:
-    """
-    Shapely 2 pode retornar array de índices (np.int64).
-    Shapely 1 geralmente retorna geometrias.
-    """
-    if cands is None:
+def _tree_returns_indices(res) -> bool:
+    """Shapely 2 geralmente retorna índices (np.int64)."""
+    if res is None:
         return False
     try:
-        if len(cands) == 0:
+        if len(res) == 0:
             return True
-        # np.int64 não é int puro; então tenta converter
-        _ = int(cands[0])
-        # mas se for geometria, int() falha
-        return True
+        return isinstance(res[0], (int,))
     except Exception:
         return False
 
@@ -188,44 +210,43 @@ def build_zone_index(zone_geojson: dict):
             continue
 
     tree = STRtree(geoms) if geoms else None
-    return {"geoms": geoms, "preps": preps_list, "props": props_list, "tree": tree}
+    geom_id_to_idx = {id(g): i for i, g in enumerate(geoms)}
+    return {"geoms": geoms, "preps": preps_list, "props": props_list, "tree": tree, "gid": geom_id_to_idx}
 
 
-def find_zone_for_click(zone_index, lat: float, lon: float) -> Optional[dict]:
+def find_zone_for_click(zone_index, lat: float, lon: float):
     tree = zone_index["tree"]
     if not tree:
         return None
 
     p = Point(lon, lat)
-    cands = tree.query(p)
-
+    candidates = tree.query(p)
     geoms = zone_index["geoms"]
     preps_list = zone_index["preps"]
     props_list = zone_index["props"]
+    gid = zone_index["gid"]
 
-    # Caso A: índices
-    if _candidates_are_indices(cands):
-        for idx in cands:
+    # Caso 1: índices
+    if _tree_returns_indices(candidates):
+        for i in candidates:
             try:
-                i = int(idx)
+                i = int(i)
                 if preps_list[i].contains(p) or geoms[i].intersects(p):
                     return props_list[i]
             except Exception:
                 continue
         return None
 
-    # Caso B: geometrias
-    # (fallback mais lento, mas seguro)
-    for g in cands:
+    # Caso 2: geometrias
+    for g in candidates:
+        i = gid.get(id(g))
+        if i is None:
+            continue
         try:
-            # achar índice por identidade é mais robusto que equality
-            # mas aqui usamos .index como fallback
-            i = geoms.index(g)
             if preps_list[i].contains(p) or geoms[i].intersects(p):
                 return props_list[i]
         except Exception:
             continue
-
     return None
 
 
@@ -238,18 +259,19 @@ def build_ruas_index(ruas_geojson: dict):
         if not geom:
             continue
         try:
-            g = shape(geom)                  # WGS84
-            g_m = transform(_to_3857, g)      # metros
+            g = shape(geom)                 # WGS84
+            g_m = transform(_to_3857, g)     # metros
             geoms_m.append(g_m)
             props_list.append(props)
         except Exception:
             continue
 
     tree = STRtree(geoms_m) if geoms_m else None
-    return {"geoms_m": geoms_m, "props": props_list, "tree": tree}
+    geom_id_to_idx = {id(g): i for i, g in enumerate(geoms_m)}
+    return {"geoms_m": geoms_m, "props": props_list, "tree": tree, "gid": geom_id_to_idx}
 
 
-def find_nearest_street(ruas_index, lat: float, lon: float, max_dist_m: float = 120.0) -> Optional[dict]:
+def find_nearest_street(ruas_index, lat: float, lon: float, max_dist_m: float = 120.0):
     if not ruas_index or not ruas_index["tree"]:
         return None
 
@@ -257,34 +279,52 @@ def find_nearest_street(ruas_index, lat: float, lon: float, max_dist_m: float = 
     tree = ruas_index["tree"]
     geoms_m = ruas_index["geoms_m"]
     props_list = ruas_index["props"]
+    gid = ruas_index["gid"]
 
     try:
         nearest = tree.nearest(p_m)
+        if nearest is None:
+            return None
 
         # Shapely 2 pode retornar índice
-        if isinstance(nearest, (int,)) or (nearest is not None and str(type(nearest)).find("numpy") >= 0):
+        if isinstance(nearest, (int,)):
             i = int(nearest)
             d = p_m.distance(geoms_m[i])
             if d > max_dist_m:
                 return None
             return props_list[i]
 
-        # Shapely 1 / alguns casos: retorna geometria
-        if nearest is None:
-            return None
-        d = p_m.distance(nearest)
+        # ou geometria
+        g = nearest
+        d = p_m.distance(g)
         if d > max_dist_m:
             return None
-
-        # fallback para achar índice
-        try:
-            i = geoms_m.index(nearest)
-            return props_list[i]
-        except Exception:
+        i = gid.get(id(g))
+        if i is None:
             return None
-
+        return props_list[i]
     except Exception:
         return None
+
+
+def compute_location(zone_index, ruas_index, lat: float, lon: float):
+    props_zone = find_zone_for_click(zone_index, lat, lon)
+    props_rua = find_nearest_street(ruas_index, lat, lon) if ruas_index else None
+
+    zona_sigla = get_prop(props_zone or {}, "sigla", "SIGLA", "zona_sigla", "ZONA_SIGLA", "name")
+    zona_nome = get_prop(props_zone or {}, "zona", "ZONA", "nome", "NOME")
+
+    rua_nome = get_prop(props_rua or {}, "log_ofic", "LOG_OFIC", "name", "NOME")
+    hierarquia = get_prop(props_rua or {}, "hierarquia", "HIERARQUIA")
+
+    return {
+        "zona_sigla": zona_sigla,
+        "zona_nome": zona_nome,
+        "rua_nome": rua_nome,
+        "hierarquia": hierarquia,
+        "raw_zone": props_zone or {},
+        "raw_rua": props_rua or {},
+    }
 
 
 # =============================
@@ -332,127 +372,103 @@ def sb_get_parking_rule(use_type_code: str) -> Optional[Dict[str, Any]]:
 
 
 # =============================
-# Cálculos
+# Cálculos urbanísticos (MVP)
 # =============================
 def estimate_pavimentos(gabarito_pav: Optional[int], gabarito_m: Optional[float]) -> Optional[int]:
-    if gabarito_pav is not None:
-        try:
+    # Se vier pavimentos oficial, usa.
+    try:
+        if gabarito_pav not in (None, "", 0):
             return int(gabarito_pav)
-        except Exception:
-            pass
-    if gabarito_m is not None:
-        try:
-            return max(1, int(float(gabarito_m) // ALTURA_PAV_ESTIMADA_M))
-        except Exception:
+    except Exception:
+        pass
+
+    # Se só vier metros, estima (bem simplificado) usando 3,0m/pav.
+    try:
+        if gabarito_m is None:
             return None
-    return None
+        pav = int(float(gabarito_m) // 3.0)
+        return max(pav, 1) if pav > 0 else 1
+    except Exception:
+        return None
 
 
-def calc_miolo_area(testada: float, profundidade: float, recuo_lat: Optional[float], recuo_front: Optional[float], recuo_fundos: Optional[float]) -> Tuple[Optional[float], Optional[str]]:
-    if recuo_lat is None or recuo_front is None or recuo_fundos is None:
-        return None, "Sem recuos completos para calcular o miolo."
-    w = float(testada) - 2.0 * float(recuo_lat)
-    d = float(profundidade) - float(recuo_front) - float(recuo_fundos)
-    if w <= 0 or d <= 0:
-        return 0.0, "Recuos inviabilizam área edificável (miolo ficou <= 0)."
-    return w * d, None
-
-
-def compute_all(
-    zone_index,
-    ruas_index,
-    lat: float,
-    lon: float,
-    use_code: str,
+def compute_urbanism(
+    zone_sigla: str,
     use_label: str,
+    use_code: str,
     testada: float,
     profundidade: float,
     esquina: bool,
+    rule: Optional[Dict[str, Any]],
+    park: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    props_zone = find_zone_for_click(zone_index, lat, lon)
-    props_rua = find_nearest_street(ruas_index, lat, lon) if ruas_index else None
-
-    zona_sigla = get_prop(props_zone or {}, "sigla", "SIGLA", "zona_sigla", "ZONA_SIGLA", "name")
-    zona_nome = get_prop(props_zone or {}, "zona", "ZONA", "nome", "NOME")
-
-    rua_nome = get_prop(props_rua or {}, "log_ofic", "LOG_OFIC", "name", "NOME")
-    hierarquia = get_prop(props_rua or {}, "hierarquia", "HIERARQUIA")
-
-    rule = sb_get_zone_rule(zona_sigla, use_code) if zona_sigla else None
-    park = sb_get_parking_rule(use_code)
-
     area_lote = float(testada) * float(profundidade)
 
-    out: Dict[str, Any] = {
-        "lat": lat,
-        "lon": lon,
-        "zona_sigla": zona_sigla,
-        "zona_nome": zona_nome,
-        "rua_nome": rua_nome,
-        "hierarquia": hierarquia,
-        "use_code": use_code,
+    calc: Dict[str, Any] = {
         "use_label": use_label,
+        "use_code": use_code,
+        "zona_sigla": zone_sigla,
         "testada": float(testada),
         "profundidade": float(profundidade),
         "esquina": bool(esquina),
         "area_lote": area_lote,
         "rule": rule,
         "park": park,
-        "raw_zone": props_zone or {},
-        "raw_rua": props_rua or {},
     }
 
-    if not rule:
-        return out
+    if rule:
+        to_max = rule.get("to_max")
+        tp_min = rule.get("tp_min")
+        ia_max = rule.get("ia_max")
 
-    # regras
-    to_max = safe_float(rule.get("to_max"))
-    tp_min = safe_float(rule.get("tp_min"))
-    ia_max = safe_float(rule.get("ia_max"))
+        rec_fr = rule.get("recuo_frontal_m")
+        rec_lat = rule.get("recuo_lateral_m")
+        rec_fun = rule.get("recuo_fundos_m")
 
-    recuo_front = safe_float(rule.get("recuo_frontal_m"))
-    recuo_lat = safe_float(rule.get("recuo_lateral_m"))
-    recuo_fundos = safe_float(rule.get("recuo_fundos_m"))
+        g_m = rule.get("gabarito_m")
+        g_pav = rule.get("gabarito_pav")
 
-    gabarito_m = safe_float(rule.get("gabarito_m"))
-    gabarito_pav = rule.get("gabarito_pav")
+        # áreas por índices
+        calc["to_max"] = to_max
+        calc["tp_min"] = tp_min
+        calc["ia_max"] = ia_max
 
-    out.update(
-        {
-            "to_max": to_max,
-            "tp_min": tp_min,
-            "ia_max": ia_max,
-            "recuo_frontal_m": recuo_front,
-            "recuo_lateral_m": recuo_lat,
-            "recuo_fundos_m": recuo_fundos,
-            "gabarito_m": gabarito_m,
-            "gabarito_pav": gabarito_pav,
-            "observacoes": rule.get("observacoes"),
-            "source_ref": rule.get("source_ref"),
-        }
-    )
+        calc["area_max_ocupacao_to"] = (float(to_max) * area_lote) if to_max is not None else None
+        calc["area_min_permeavel"] = (float(tp_min) * area_lote) if tp_min is not None else None
+        calc["area_max_total_construida"] = (float(ia_max) * area_lote) if ia_max is not None else None
 
-    # m² (TO/TP/IA)
-    out["area_max_ocupacao_to"] = (to_max * area_lote) if to_max is not None else None
-    out["area_min_permeavel"] = (tp_min * area_lote) if tp_min is not None else None
-    out["area_max_total_construida"] = (ia_max * area_lote) if ia_max is not None else None
+        # recuos
+        calc["recuo_frontal_m"] = rec_fr
+        calc["recuo_lateral_m"] = rec_lat
+        calc["recuo_fundos_m"] = rec_fun
+        calc["gabarito_m"] = g_m
+        calc["gabarito_pav"] = g_pav
+        calc["observacoes"] = rule.get("observacoes")
+        calc["source_ref"] = rule.get("source_ref")
 
-    # miolo (recuos)
-    miolo, miolo_warn = calc_miolo_area(testada, profundidade, recuo_lat, recuo_front, recuo_fundos)
-    out["area_miolo"] = miolo
-    out["miolo_warn"] = miolo_warn
+        # miolo por recuos (retângulo útil)
+        if rec_lat is not None and rec_fr is not None and rec_fun is not None:
+            largura_util = float(testada) - (2.0 * float(rec_lat))
+            prof_util = float(profundidade) - float(rec_fr) - float(rec_fun)
+            largura_util = max(largura_util, 0.0)
+            prof_util = max(prof_util, 0.0)
+            area_miolo = largura_util * prof_util
+        else:
+            area_miolo = None
 
-    # ocupação máxima real (menor entre TO e miolo, quando miolo existe)
-    if out["area_max_ocupacao_to"] is not None and miolo is not None:
-        out["area_max_ocupacao_real"] = min(out["area_max_ocupacao_to"], miolo)
-    else:
-        out["area_max_ocupacao_real"] = out["area_max_ocupacao_to"]
+        calc["largura_util_miolo"] = None if rec_lat is None else max(float(testada) - (2.0 * float(rec_lat)), 0.0)
+        calc["prof_util_miolo"] = None if (rec_fr is None or rec_fun is None) else max(float(profundidade) - float(rec_fr) - float(rec_fun), 0.0)
+        calc["area_miolo"] = area_miolo
 
-    # estimativa de pavimentos
-    out["pavimentos_estimados"] = estimate_pavimentos(
-        gabarito_pav if gabarito_pav not in (None, "") else None,
-        gabarito_m,
-    )
+        # térreo "real": menor entre TO e miolo (quando ambos existirem)
+        area_to = calc.get("area_max_ocupacao_to")
+        if area_to is not None and area_miolo is not None:
+            calc["area_max_ocupacao_real"] = min(float(area_to), float(area_miolo))
+        else:
+            calc["area_max_ocupacao_real"] = area_to if area_to is not None else area_miolo
+
+        # estimativa de pavimentos
+        calc["pavimentos_estimados"] = estimate_pavimentos(g_pav, g_m)
 
     # vagas (MVP)
     vagas = None
@@ -461,19 +477,30 @@ def compute_all(
         value = park.get("value") or 0
         min_v = park.get("min_vagas")
         if metric == "fixed":
-            vagas = int(value)
+            try:
+                vagas = int(value)
+            except Exception:
+                vagas = None
         elif metric == "per_unit":
+            # MVP: sem "unidades". RES_UNI assume 1 unidade.
             if use_code == "RES_UNI":
-                vagas = max(int(value), int(min_v or 0))
+                try:
+                    vagas = max(int(value), int(min_v or 0))
+                except Exception:
+                    vagas = None
             else:
                 vagas = None
         elif metric == "per_area":
-            vagas = int((area_lote * float(value)) // 1)
-            if min_v is not None:
-                vagas = max(vagas, int(min_v))
-    out["vagas_min"] = vagas
+            # value = vagas por m² (ex 1/50 = 0.02)
+            try:
+                vagas = int((area_lote * float(value)) // 1)
+                if min_v is not None:
+                    vagas = max(vagas, int(min_v))
+            except Exception:
+                vagas = None
 
-    return out
+    calc["vagas_min"] = vagas
+    return calc
 
 
 # =============================
@@ -498,12 +525,14 @@ ruas_index = build_ruas_index(ruas_raw) if ruas_raw else None
 # =============================
 if "click" not in st.session_state:
     st.session_state["click"] = None
+if "res" not in st.session_state:
+    st.session_state["res"] = None
 if "calc" not in st.session_state:
     st.session_state["calc"] = None
 
 
 # =============================
-# Top layout (Mapa + Inputs)
+# Layout (Mapa + Painel)
 # =============================
 col_map, col_panel = st.columns([3, 1], gap="large")
 
@@ -526,20 +555,18 @@ with col_map:
 
     click = st.session_state["click"]
     if click:
-        lat0 = float(click["lat"])
-        lon0 = float(click["lng"])
-        html = popup_html(clicked=True)
+        lat = float(click["lat"])
+        lon = float(click["lng"])
+        html = popup_html(st.session_state["res"])
         folium.Marker(
-            location=[lat0, lon0],
+            location=[lat, lon],
             tooltip="Ponto selecionado",
             popup=folium.Popup(html, max_width=420, show=True),
             icon=folium.Icon(color="blue", icon="info-sign"),
         ).add_to(m)
-        m.location = [lat0, lon0]
+
+        m.location = [lat, lon]
         m.zoom_start = 16
-    else:
-        # sem clique: popup "dummy" não precisa
-        pass
 
     out = st_folium(m, width=1200, height=700, key="main_map")
 
@@ -548,16 +575,31 @@ with col_map:
         new_click = {"lat": float(last["lat"]), "lng": float(last["lng"])}
         if st.session_state["click"] != new_click:
             st.session_state["click"] = new_click
+            st.session_state["res"] = None
             st.session_state["calc"] = None
             st.rerun()
 
-with col_panel:
-    st.subheader("Dados do lote/projeto")
 
-    # uso (do Supabase)
+with col_panel:
+    st.subheader("1) Marque o lote no mapa")
+
+    click = st.session_state["click"]
+    if not click:
+        st.info("Clique no mapa para marcar um ponto.")
+        st.stop()
+
+    lat = float(click["lat"])
+    lon = float(click["lng"])
+    st.write("**Coordenadas clicadas**")
+    st.code(f"lat: {lat:.6f}\nlon: {lon:.6f}", language="text")
+
+    st.subheader("2) Dados do lote/projeto")
+
+    # Uso (do Supabase) – filtra residencial
     use_types = sb_list_use_types()
     use_options = {u["label"]: u["code"] for u in use_types if u.get("category") == "Residencial"}
 
+    # fallback se não vier nada
     if not use_options:
         use_options = {
             "Residencial Unifamiliar (Casa)": "RES_UNI",
@@ -571,211 +613,236 @@ with col_panel:
     profundidade = st.number_input("Profundidade / Lateral (m)", min_value=1.0, value=30.0, step=0.5)
     esquina = st.checkbox("Lote de esquina")
 
-    st.caption("Clique no mapa para marcar o lote. Depois, clique em **Calcular**.")
+    st.subheader("3) Calcular")
 
-    can_calc = st.session_state["click"] is not None
-    if st.button("🧮 Calcular", use_container_width=True, disabled=not can_calc):
-        c = st.session_state["click"]
-        lat = float(c["lat"])
-        lon = float(c["lng"])
+    if st.button("🧮 Calcular", use_container_width=True):
+        with st.spinner("Calculando..."):
+            # Localização (zona/rua) só aqui, para ficar leve
+            res = compute_location(zone_index, ruas_index, lat, lon)
+            st.session_state["res"] = res
 
-        with st.spinner("Calculando viabilidade (zona/rua + regras + índices)..."):
-            st.session_state["calc"] = compute_all(
-                zone_index=zone_index,
-                ruas_index=ruas_index,
-                lat=lat,
-                lon=lon,
-                use_code=use_code,
+            zona_sigla = res.get("zona_sigla") or ""
+            rule = sb_get_zone_rule(zona_sigla, use_code)
+            park = sb_get_parking_rule(use_code)
+
+            calc = compute_urbanism(
+                zone_sigla=zona_sigla,
                 use_label=use_label,
+                use_code=use_code,
                 testada=float(testada),
                 profundidade=float(profundidade),
                 esquina=bool(esquina),
+                rule=rule,
+                park=park,
             )
+            st.session_state["calc"] = calc
+
         st.rerun()
 
-    if not can_calc:
-        st.info("Primeiro clique no mapa para marcar o ponto do lote.")
+    st.caption("💡 Dica: o pin aparece na hora. O cálculo acontece só quando você clicar em **Calcular**.")
 
 
 # =============================
-# Resultados (embaixo do mapa)
+# RESULTADOS (embaixo do mapa) – “leigo-friendly”
 # =============================
-st.divider()
-st.subheader("Resultados")
-
+res = st.session_state.get("res")
 calc = st.session_state.get("calc")
-if not calc:
-    st.caption("Após clicar no mapa e preencher os dados, clique em **Calcular** para ver o resultado aqui embaixo.")
-    st.stop()
 
-# --- resumo de localização
-c1, c2, c3 = st.columns([1.3, 1.3, 1.4])
-with c1:
-    st.markdown("### Localização")
-    st.write("**Coordenadas:**", f'{calc["lat"]:.6f}, {calc["lon"]:.6f}')
-    st.write("**Zona:**", (calc.get("zona_nome") or "—"))
-    st.write("**Sigla:**", (calc.get("zona_sigla") or "—"))
-with c2:
-    st.markdown("### Via")
-    st.write("**Rua:**", (calc.get("rua_nome") or "—"))
-    st.write("**Hierarquia:**", (calc.get("hierarquia") or "—"))
-with c3:
-    st.markdown("### Lote / Uso")
-    st.write("**Uso:**", calc.get("use_label") or "—")
-    st.write("**Área do lote:**", fmt_m2(calc.get("area_lote")))
-    st.write("**Esquina:**", "Sim" if calc.get("esquina") else "Não")
-
-# --- regra
-rule = calc.get("rule")
-if not calc.get("zona_sigla"):
-    st.warning("Não consegui identificar a sigla da zona nesse ponto. Verifique se o ponto está dentro do zoneamento.")
-    st.stop()
-    st.divider()
-st.markdown("## Resumo do que você pode fazer (modo simples)")
-
-area_lote = calc.get("area_lote")
-area_to = calc.get("area_max_ocupacao_to")              # TO x lote
-area_miolo = calc.get("area_miolo")                     # miolo por recuos
-area_terreo = calc.get("area_max_ocupacao_real")        # menor entre TO e miolo
-area_total = calc.get("area_max_total_construida")      # IA x lote
-area_perm = calc.get("area_min_permeavel")              # TP x lote
-pavs = calc.get("pavimentos_estimados")
-
-# Proteções (caso algo venha None)
-area_lote_txt = fmt_m2(area_lote)
-area_terreo_txt = fmt_m2(area_terreo)
-area_total_txt = fmt_m2(area_total)
-area_perm_txt = fmt_m2(area_perm)
-
-# Frases simples
-st.success(f"✅ No térreo, você pode ocupar até **{area_terreo_txt}**.")
-
-# total construído (IA)
-if area_total is not None:
-    if pavs is not None and pavs > 0 and area_terreo is not None:
-        # só uma estimativa amigável; não é regra oficial, é “leitura” do limite
-        area_media_por_pav = area_total / pavs
-        st.info(
-            f"🏗️ No total (somando pavimentos), você pode construir até **{area_total_txt}**.\n\n"
-            f"📌 Isso dá uma média de **{fmt_m2(area_media_por_pav)} por pavimento** (estimativa)."
-        )
-    else:
-        st.info(f"🏗️ No total (somando pavimentos), você pode construir até **{area_total_txt}**.")
-else:
-    st.warning("🏗️ Não foi possível calcular o total construído (IA não cadastrado para essa regra).")
-
-# permeável
-if area_perm is not None:
-    st.warning(f"🌿 Você precisa deixar pelo menos **{area_perm_txt}** de área permeável.")
-else:
-    st.warning("🌿 Não foi possível calcular a área permeável (TP não cadastrado para essa regra).")
-
-# Pavimentos (explicação simples)
-if calc.get("gabarito_pav") not in (None, "", 0):
-    st.write(f"🏢 **Limite de altura:** até **{calc.get('gabarito_pav')} pavimentos** (pela regra).")
-elif calc.get("gabarito_m") is not None:
-    st.write(
-        f"🏢 **Limite de altura:** até **{fmt_m(calc.get('gabarito_m'))}** "
-        f"(estimamos **{pavs if pavs is not None else '—'} pavimentos**)."
-    )
-else:
-    st.caption("🏢 Altura/gabarito ainda não cadastrado para essa regra.")
-
-# Mostra “por que” o térreo deu aquele número (bem didático)
 st.divider()
-st.markdown("### Como cheguei no limite do térreo (bem simples)")
+st.markdown("## Resultados")
 
-colA, colB = st.columns(2)
-with colA:
-    st.write("**Limite por TO (taxa de ocupação):**", fmt_m2(area_to))
-with colB:
-    st.write("**Limite por recuos (miolo):**", fmt_m2(area_miolo) if area_miolo is not None else "—")
+if not res or not calc:
+    st.caption("Clique no mapa, preencha os dados e depois clique em **Calcular** para ver os resultados aqui embaixo.")
+    st.stop()
 
-if area_to is not None and area_miolo is not None:
-    if area_miolo < area_to:
-        st.caption("➡️ O que manda aqui são os **recuos**, porque o miolo ficou menor que o limite por TO.")
-    else:
-        st.caption("➡️ O que manda aqui é a **TO**, porque ela ficou menor (mais restritiva) que o miolo.")
-else:
-    st.caption("➡️ Para comparar TO x miolo, precisa ter TO e recuos completos cadastrados.")
+# Linha 1: resumo (Localização / Via / Lote-Uso)
+c1, c2, c3 = st.columns(3)
 
+with c1:
+    st.markdown(
+        f"""
+        <div class="card">
+          <div class="pill">📍 Localização</div>
+          <div class="muted">Coordenadas</div>
+          <div class="big">{lat:.6f}, {lon:.6f}</div>
+          <div class="muted" style="margin-top:10px;">Zona</div>
+          <div class="big">{res.get("zona_nome") or "—"}</div>
+          <div class="muted" style="margin-top:10px;">Sigla</div>
+          <div class="big">{res.get("zona_sigla") or "—"}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
+with c2:
+    st.markdown(
+        f"""
+        <div class="card">
+          <div class="pill">🛣️ Via</div>
+          <div class="muted">Rua</div>
+          <div class="big">{res.get("rua_nome") or "—"}</div>
+          <div class="muted" style="margin-top:10px;">Hierarquia</div>
+          <div class="big">{res.get("hierarquia") or "—"}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with c3:
+    area_lote = calc.get("area_lote")
+    st.markdown(
+        f"""
+        <div class="card">
+          <div class="pill">🏡 Lote / Uso</div>
+          <div class="muted">Uso</div>
+          <div class="big">{calc.get("use_label")}</div>
+          <div class="muted" style="margin-top:10px;">Área do lote</div>
+          <div class="big">{fmt_m2(area_lote)}</div>
+          <div class="muted" style="margin-top:10px;">Esquina</div>
+          <div class="big">{"Sim" if calc.get("esquina") else "Não"}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# Se não achou zona, mostra e para
+if not (res.get("zona_sigla") or res.get("zona_nome")):
+    st.warning("Não encontrei zona para esse ponto (verifique se clicou dentro do município/zoneamento).")
+    with st.expander("Debug (raw)"):
+        st.write("zone raw:")
+        st.json(res.get("raw_zone") or {})
+    st.stop()
+
+# Se não tem regra no Supabase, avisa
+rule = calc.get("rule")
 if not rule:
     st.warning(f"Sem regra cadastrada no Supabase para **{calc.get('zona_sigla')} + {calc.get('use_code')}**.")
     st.caption("Cadastre em `zone_rules` (TO/TP/IA/recuos/gabarito) e tente novamente.")
     st.stop()
 
 st.divider()
+st.markdown("## Resumo do que você pode fazer (modo simples)")
 
-# --- índices + m²
-st.markdown("## Índices e áreas (em m²)")
+# Frases leigo-friendly (EXATAMENTE no estilo que você pediu)
+area_terreo = calc.get("area_max_ocupacao_real")
+area_total = calc.get("area_max_total_construida")
+area_perm = calc.get("area_min_permeavel")
 
-idx1, idx2, idx3 = st.columns(3)
-with idx1:
-    st.metric("TO máx", fmt_pct(calc.get("to_max")))
-    st.write("**TO × Área do lote:**", fmt_m2(calc.get("area_max_ocupacao_to")))
-with idx2:
-    st.metric("TP mín", fmt_pct(calc.get("tp_min")))
-    st.write("**Área mín. permeável:**", fmt_m2(calc.get("area_min_permeavel")))
-with idx3:
-    ia = calc.get("ia_max")
-    st.metric("IA máx", (f"{ia:.2f}" if isinstance(ia, (int, float)) else ("—" if ia is None else str(ia))))
-    st.write("**Área máx. construída total (IA × lote):**", fmt_m2(calc.get("area_max_total_construida")))
+pavs = calc.get("pavimentos_estimados")
+g_pav = calc.get("gabarito_pav")
+g_m = calc.get("gabarito_m")
 
-# --- recuos + miolo
-st.divider()
-st.markdown("## Recuos e área edificável (miolo)")
+# Card 1: térreo
+st.markdown(
+    f"""
+    <div class="card">
+      <h4>✅ Ocupação no térreo</h4>
+      <div class="big">Seu lote tem {fmt_m2(calc.get("area_lote"))}. No térreo, você pode ocupar até {fmt_m2(area_terreo)}.</div>
+      <div class="muted">Esse limite considera TO e recuos (a regra mais restritiva vence).</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-r1, r2, r3, r4 = st.columns(4)
-with r1:
-    st.write("**Recuo frontal:**", fmt_m(calc.get("recuo_frontal_m")))
-with r2:
-    st.write("**Recuo lateral:**", fmt_m(calc.get("recuo_lateral_m")))
-with r3:
-    st.write("**Recuo fundos:**", fmt_m(calc.get("recuo_fundos_m")))
-with r4:
-    pav = calc.get("pavimentos_estimados")
-    st.write("**Pavimentos (estim.):**", pav if pav is not None else "—")
+# Card 2: permeável
+st.markdown(
+    f"""
+    <div class="card" style="margin-top:12px;">
+      <h4>🌿 Área permeável</h4>
+      <div class="big">Você precisa deixar {fmt_m2(area_perm)} permeável (área que absorve água).</div>
+      <div class="muted">Ex.: jardins, solo natural, áreas drenantes (depende do que a prefeitura aceita).</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-miolo = calc.get("area_miolo")
-miolo_warn = calc.get("miolo_warn")
-if miolo is None:
-    st.info("**Miolo não calculado**: faltam recuos completos na regra (frontal/lateral/fundos).")
+# Card 3: total construído (IA)
+total_txt = fmt_m2(area_total)
+pav_txt = f"{pavs} pavimentos (estimativa)" if pavs is not None else "—"
+altura_txt = ""
+if g_pav not in (None, "", 0):
+    altura_txt = f"Limite de altura: até {g_pav} pavimentos (pela regra)."
+elif g_m is not None:
+    altura_txt = f"Limite de altura: até {fmt_m(g_m)} (estimamos {pav_txt})."
 else:
-    st.write("**Área do miolo (por recuos):**", fmt_m2(miolo))
-    if miolo_warn:
-        st.warning(miolo_warn)
+    altura_txt = "Limite de altura ainda não cadastrado para essa regra."
 
-# --- comparação TO x miolo
+st.markdown(
+    f"""
+    <div class="card" style="margin-top:12px;">
+      <h4>🏗️ Total construído (somando pavimentos)</h4>
+      <div class="big">O total construído permitido é {total_txt} — isso inclui todos os pavimentos somados.</div>
+      <div class="muted">{altura_txt}</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# Comparação TO x miolo (explicação simples)
 st.divider()
-st.markdown("## Ocupação máxima no térreo (comparação)")
+st.markdown("### Por que o térreo ficou nesse valor?")
+
+colA, colB, colC = st.columns(3)
+with colA:
+    st.markdown(
+        f"""
+        <div class="card">
+          <div class="muted">Limite por TO</div>
+          <div class="big">{fmt_m2(calc.get("area_max_ocupacao_to"))}</div>
+          <div class="muted">{fmt_pct(calc.get("to_max"))} do lote</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+with colB:
+    st.markdown(
+        f"""
+        <div class="card">
+          <div class="muted">Limite por recuos (miolo)</div>
+          <div class="big">{fmt_m2(calc.get("area_miolo"))}</div>
+          <div class="muted">({fmt_m(calc.get("largura_util_miolo"))} × {fmt_m(calc.get("prof_util_miolo"))})</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+with colC:
+    st.markdown(
+        f"""
+        <div class="card">
+          <div class="muted">O que vale no térreo</div>
+          <div class="big">{fmt_m2(calc.get("area_max_ocupacao_real"))}</div>
+          <div class="muted">Sempre o menor entre TO e miolo</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 area_to = calc.get("area_max_ocupacao_to")
-area_real = calc.get("area_max_ocupacao_real")
+area_miolo = calc.get("area_miolo")
+if area_to is not None and area_miolo is not None:
+    if float(area_miolo) < float(area_to):
+        st.caption("➡️ Aqui quem manda são os **recuos**: o miolo ficou menor que o limite por TO.")
+    else:
+        st.caption("➡️ Aqui quem manda é a **TO**: o limite por TO ficou menor que o miolo.")
+else:
+    st.caption("➡️ Para comparar TO x miolo, é preciso ter TO e recuos cadastrados nessa regra.")
 
-cA, cB, cC = st.columns([1, 1, 1])
-with cA:
-    st.write("**Limite por TO:**", fmt_m2(area_to))
-with cB:
-    st.write("**Limite por recuos (miolo):**", fmt_m2(miolo) if miolo is not None else "—")
-with cC:
-    st.success(f"**Ocupação máx. recomendada (menor limite): {fmt_m2(area_real)}**")
-
-# --- gabarito
-st.divider()
-st.markdown("## Gabarito")
-st.write("**Gabarito (m):**", fmt_m(calc.get("gabarito_m")))
-st.write("**Gabarito (pav):**", calc.get("gabarito_pav") or "—")
-st.caption(f"Estimativa de pavimentos por {ALTURA_PAV_ESTIMADA_M:.1f} m/pav quando não existir gabarito em pav.")
-
-# --- vagas
-vagas = calc.get("vagas_min")
-if vagas is not None:
+# Vagas
+if calc.get("vagas_min") is not None:
     st.divider()
     st.markdown("## Vagas mínimas")
-    st.write("**Vagas mín.:**", int(vagas))
+    st.markdown(
+        f"""
+        <div class="card">
+          <h4>🚗 Estacionamento</h4>
+          <div class="big">Vagas mínimas: {int(calc.get("vagas_min"))}</div>
+          <div class="muted">Regra puxada do Supabase (tabela parking_rules).</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-# --- observações/fonte
+# Observações / Fonte
 if calc.get("observacoes"):
     st.divider()
     st.markdown("## Observações")
@@ -785,11 +852,9 @@ if calc.get("source_ref"):
     st.caption(f"Fonte: {calc.get('source_ref')}")
 
 with st.expander("Debug (raw)"):
+    st.write("location:")
+    st.json(res or {})
     st.write("rule:")
     st.json(calc.get("rule") or {})
     st.write("parking:")
     st.json(calc.get("park") or {})
-    st.write("raw zone props:")
-    st.json(calc.get("raw_zone") or {})
-    st.write("raw rua props:")
-    st.json(calc.get("raw_rua") or {})
