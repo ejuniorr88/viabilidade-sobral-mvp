@@ -8,7 +8,6 @@ from streamlit_folium import st_folium
 from shapely.geometry import shape, Point
 from shapely.ops import transform
 from shapely.prepared import prep
-from shapely.strtree import STRtree
 from pyproj import Transformer
 
 
@@ -68,7 +67,7 @@ def ensure_properties_keys(geojson: dict, keys: tuple[str, ...]) -> dict:
 
 
 def popup_html(result: dict | None):
-    # Mostra placeholder se ainda não consultou
+    # Placeholder até clicar em "Ver resultado"
     if not result:
         return """
         <div style="font-family: Arial, sans-serif; font-size: 13px; line-height: 1.35; min-width:260px;">
@@ -103,9 +102,8 @@ def load_geojson(path: Path):
 @st.cache_resource(show_spinner=False)
 def build_zone_index(zone_geojson: dict):
     """
-    Índice rápido para zoneamento:
-    - STRtree para filtrar candidatos
-    - prep() para contains ser rápido
+    Índice estável (SEM STRtree):
+    - lista de geometrias + prepared para contains rápido
     """
     geoms, preps_list, props_list = [], [], []
     for feat in (zone_geojson or {}).get("features") or []:
@@ -120,28 +118,17 @@ def build_zone_index(zone_geojson: dict):
             props_list.append(props)
         except Exception:
             continue
-
-    tree = STRtree(geoms) if geoms else None
-    geom_id_to_idx = {id(g): i for i, g in enumerate(geoms)}
-    return {"geoms": geoms, "preps": preps_list, "props": props_list, "tree": tree, "gid": geom_id_to_idx}
+    return {"geoms": geoms, "preps": preps_list, "props": props_list}
 
 
 def find_zone_for_click(zone_index, lat: float, lon: float):
-    tree = zone_index["tree"]
-    if not tree:
-        return None
-
+    """Busca zona por loop (estável e suficiente para poucas zonas)."""
     p = Point(lon, lat)
-    candidates = tree.query(p)  # retorna geometrias (normalmente)
-    gid = zone_index["gid"]
     geoms = zone_index["geoms"]
     preps_list = zone_index["preps"]
     props_list = zone_index["props"]
 
-    for g in candidates:
-        i = gid.get(id(g))
-        if i is None:
-            continue
+    for i in range(len(geoms)):
         try:
             if preps_list[i].contains(p) or geoms[i].intersects(p):
                 return props_list[i]
@@ -153,9 +140,9 @@ def find_zone_for_click(zone_index, lat: float, lon: float):
 @st.cache_resource(show_spinner=False)
 def build_ruas_index(ruas_geojson: dict):
     """
-    Índice rápido para ruas:
-    - projeta tudo para EPSG:3857 uma vez
-    - STRtree para nearest
+    Pré-processa ruas:
+    - projeta para 3857 UMA vez
+    - guarda geometria em metros + props
     """
     geoms_m, props_list = [], []
     for feat in (ruas_geojson or {}).get("features") or []:
@@ -170,34 +157,35 @@ def build_ruas_index(ruas_geojson: dict):
             props_list.append(props)
         except Exception:
             continue
-
-    tree = STRtree(geoms_m) if geoms_m else None
-    geom_id_to_idx = {id(g): i for i, g in enumerate(geoms_m)}
-    return {"geoms_m": geoms_m, "props": props_list, "tree": tree, "gid": geom_id_to_idx}
+    return {"geoms_m": geoms_m, "props": props_list}
 
 
 def find_nearest_street(ruas_index, lat: float, lon: float, max_dist_m: float = 120.0):
-    if not ruas_index or not ruas_index["tree"]:
+    """Rua mais próxima por loop (rodando só ao clicar no botão)."""
+    if not ruas_index or not ruas_index["geoms_m"]:
         return None
 
     p_m = transform(_to_3857, Point(lon, lat))
-    tree = ruas_index["tree"]
+    geoms_m = ruas_index["geoms_m"]
+    props_list = ruas_index["props"]
 
-    try:
-        nearest_geom = tree.nearest(p_m)  # geralmente retorna geometria
-        if nearest_geom is None:
-            return None
+    best_i = None
+    best_d = float("inf")
 
-        d = p_m.distance(nearest_geom)
-        if d > max_dist_m:
-            return None
+    # Loop simples e estável
+    for i, g in enumerate(geoms_m):
+        try:
+            d = p_m.distance(g)
+            if d < best_d:
+                best_d = d
+                best_i = i
+        except Exception:
+            continue
 
-        i = ruas_index["gid"].get(id(nearest_geom))
-        if i is None:
-            return None
-        return ruas_index["props"][i]
-    except Exception:
+    if best_i is None or best_d > max_dist_m:
         return None
+
+    return props_list[best_i]
 
 
 def compute_result(zone_index, ruas_index, lat: float, lon: float):
@@ -253,7 +241,6 @@ if "result" not in st.session_state:
 col_map, col_panel = st.columns([3, 1], gap="large")
 
 with col_map:
-    # Mapa base
     m = folium.Map(location=[-3.69, -40.35], zoom_start=13, tiles="OpenStreetMap")
 
     # Zoneamento (visual)
@@ -271,13 +258,15 @@ with col_map:
         ),
     ).add_to(m)
 
-    # PIN (sempre que tiver clique salvo, aparece instantaneamente)
+    folium.LayerControl(collapsed=False).add_to(m)
+
+    # PIN sempre que tiver clique salvo (instantâneo)
     click = st.session_state["click"]
     if click:
         lat = float(click["lat"])
         lon = float(click["lng"])
 
-        # Popup mostra placeholder até clicar "Ver resultado"
+        # Popup: placeholder até consultar
         html = popup_html(st.session_state["result"])
         folium.Marker(
             location=[lat, lon],
@@ -286,7 +275,7 @@ with col_map:
             icon=folium.Icon(color="blue", icon="info-sign"),
         ).add_to(m)
 
-        # Centraliza um pouco no clique (sem exagerar zoom)
+        # Centraliza no clique
         m.location = [lat, lon]
         m.zoom_start = 16
 
@@ -297,7 +286,7 @@ with col_map:
     if last:
         new_click = {"lat": float(last["lat"]), "lng": float(last["lng"])}
 
-        # Se mudou o ponto, limpa o resultado (para obrigar o botão)
+        # Se mudou o ponto, limpa o resultado (obriga botão novamente)
         if st.session_state["click"] != new_click:
             st.session_state["click"] = new_click
             st.session_state["result"] = None
