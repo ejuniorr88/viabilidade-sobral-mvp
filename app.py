@@ -9,7 +9,6 @@ from streamlit_folium import st_folium
 
 from shapely.geometry import shape, Point
 from shapely.ops import transform
-from shapely.prepared import prep
 from shapely.strtree import STRtree
 from pyproj import Transformer
 
@@ -36,6 +35,7 @@ _to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True).transf
 @st.cache_resource(show_spinner=False)
 def get_supabase():
     url = st.secrets.get("SUPABASE_URL") or os.getenv("SUPABASE_URL")
+    # OBS: seu "anon key" virou "Publishable Key" no painel, mas no código continua sendo a mesma chave pública
     key = st.secrets.get("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_ANON_KEY")
     if not url or not key:
         return None
@@ -119,7 +119,7 @@ def fmt_pct(x: Optional[float]) -> str:
     if x is None:
         return "—"
     try:
-        return f"{float(x)*100:.0f}%"
+        return f"{float(x) * 100:.0f}%"
     except Exception:
         return "—"
 
@@ -151,9 +151,19 @@ def load_geojson(path: Path):
         return json.load(f)
 
 
+# ---------- ZONEAMENTO (FIX DEFINITIVO: NÃO USAR id()) ----------
 @st.cache_resource(show_spinner=False)
 def build_zone_index(zone_geojson: dict):
-    geoms, preps_list, props_list = [], [], []
+    """
+    Índice robusto:
+    - STRtree para reduzir candidatos
+    - NÃO usa id(g) (STRtree pode devolver clones)
+    - mapeia WKB -> índice (estável)
+    """
+    geoms: list = []
+    props_list: list = []
+    wkb_to_idx: dict = {}
+
     for feat in (zone_geojson or {}).get("features") or []:
         geom = feat.get("geometry")
         props = feat.get("properties") or {}
@@ -162,67 +172,102 @@ def build_zone_index(zone_geojson: dict):
         try:
             g = shape(geom)
             geoms.append(g)
-            preps_list.append(prep(g))
             props_list.append(props)
         except Exception:
             continue
 
+    # chave estável: bytes WKB
+    for i, g in enumerate(geoms):
+        try:
+            wkb_to_idx[g.wkb] = i
+        except Exception:
+            pass
+
     tree = STRtree(geoms) if geoms else None
-    geom_id_to_idx = {id(g): i for i, g in enumerate(geoms)}
-    return {"geoms": geoms, "preps": preps_list, "props": props_list, "tree": tree, "gid": geom_id_to_idx}
+    return {"geoms": geoms, "props": props_list, "tree": tree, "wkb_to_idx": wkb_to_idx}
 
 
 def find_zone_for_click(zone_index, lat: float, lon: float):
-    tree = zone_index["tree"]
+    tree = zone_index.get("tree")
     if not tree:
         return None
 
     p = Point(lon, lat)
-    candidates = tree.query(p)  # geometrias
-    gid = zone_index["gid"]
+
+    try:
+        candidates = tree.query(p)
+    except Exception:
+        return None
+
     geoms = zone_index["geoms"]
-    preps_list = zone_index["preps"]
     props_list = zone_index["props"]
+    wkb_to_idx = zone_index.get("wkb_to_idx") or {}
 
     for g in candidates:
-        i = gid.get(id(g))
-        if i is None:
-            continue
         try:
-            if preps_list[i].contains(p) or geoms[i].intersects(p):
-                return props_list[i]
+            if g.contains(p) or g.intersects(p):
+                # resolve índice por WKB (estável)
+                i = wkb_to_idx.get(g.wkb)
+                if i is not None:
+                    return props_list[i]
+
+                # fallback (mais lento, mas só em casos raros)
+                try:
+                    i2 = geoms.index(g)
+                    return props_list[i2]
+                except Exception:
+                    return None
         except Exception:
             continue
+
     return None
 
 
+# ---------- RUAS (FIX SEM id()) ----------
 @st.cache_resource(show_spinner=False)
 def build_ruas_index(ruas_geojson: dict):
-    geoms_m, props_list = [], []
+    """
+    Índice robusto para ruas:
+    - projeta para 3857 uma vez
+    - STRtree para nearest
+    - mapeia WKB -> índice (estável)
+    """
+    geoms_m: list = []
+    props_list: list = []
+    wkb_to_idx: dict = {}
+
     for feat in (ruas_geojson or {}).get("features") or []:
         geom = feat.get("geometry")
         props = feat.get("properties") or {}
         if not geom:
             continue
         try:
-            g = shape(geom)                 # WGS84
+            g = shape(geom)                  # WGS84
             g_m = transform(_to_3857, g)     # metros
             geoms_m.append(g_m)
             props_list.append(props)
         except Exception:
             continue
 
+    for i, g in enumerate(geoms_m):
+        try:
+            wkb_to_idx[g.wkb] = i
+        except Exception:
+            pass
+
     tree = STRtree(geoms_m) if geoms_m else None
-    geom_id_to_idx = {id(g): i for i, g in enumerate(geoms_m)}
-    return {"geoms_m": geoms_m, "props": props_list, "tree": tree, "gid": geom_id_to_idx}
+    return {"geoms_m": geoms_m, "props": props_list, "tree": tree, "wkb_to_idx": wkb_to_idx}
 
 
 def find_nearest_street(ruas_index, lat: float, lon: float, max_dist_m: float = 120.0):
-    if not ruas_index or not ruas_index["tree"]:
+    if not ruas_index or not ruas_index.get("tree"):
         return None
 
     p_m = transform(_to_3857, Point(lon, lat))
     tree = ruas_index["tree"]
+    geoms_m = ruas_index["geoms_m"]
+    props_list = ruas_index["props"]
+    wkb_to_idx = ruas_index.get("wkb_to_idx") or {}
 
     try:
         nearest_geom = tree.nearest(p_m)
@@ -233,10 +278,16 @@ def find_nearest_street(ruas_index, lat: float, lon: float, max_dist_m: float = 
         if d > max_dist_m:
             return None
 
-        i = ruas_index["gid"].get(id(nearest_geom))
-        if i is None:
+        i = wkb_to_idx.get(nearest_geom.wkb)
+        if i is not None:
+            return props_list[i]
+
+        # fallback raro
+        try:
+            i2 = geoms_m.index(nearest_geom)
+            return props_list[i2]
+        except Exception:
             return None
-        return ruas_index["props"][i]
     except Exception:
         return None
 
@@ -276,7 +327,11 @@ def sb_get_zone_rule(zone_sigla: str, use_type_code: str) -> Optional[Dict[str, 
         return None
     res = (
         sb.table("zone_rules")
-        .select("zone_sigla,use_type_code,to_max,tp_min,ia_max,recuo_frontal_m,recuo_lateral_m,recuo_fundos_m,gabarito_m,gabarito_pav,observacoes,source_ref")
+        .select(
+            "zone_sigla,use_type_code,to_max,tp_min,ia_max,"
+            "recuo_frontal_m,recuo_lateral_m,recuo_fundos_m,"
+            "gabarito_m,gabarito_pav,observacoes,source_ref"
+        )
         .eq("zone_sigla", zone_sigla)
         .eq("use_type_code", use_type_code)
         .limit(1)
@@ -492,13 +547,12 @@ with col_panel:
             if metric == "fixed":
                 vagas = int(value)
             elif metric == "per_unit":
-                # sem "unidades" ainda no MVP -> assume 1 unidade p/ RES_UNI e "—" p/ multi (ajustar depois)
+                # sem "unidades" ainda no MVP -> assume 1 unidade p/ RES_UNI
                 if use_code == "RES_UNI":
                     vagas = max(int(value), int(min_v or 0))
                 else:
                     vagas = None
             elif metric == "per_area":
-                # value = vagas por m² (ex 1/50 = 0.02)
                 vagas = int((area_lote * float(value)) // 1)
                 if min_v is not None:
                     vagas = max(vagas, int(min_v))
@@ -558,6 +612,8 @@ with col_panel:
         st.caption(f"Fonte: {calc.get('source_ref')}")
 
     with st.expander("Debug (raw)"):
+        st.write("result:")
+        st.json(res or {})
         st.write("rule:")
         st.json(calc.get("rule") or {})
         st.write("parking:")
