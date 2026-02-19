@@ -3,3 +3,4 @@ streamlit-folium
 folium
 shapely==2.0.3
 pyproj==3.6.1
+supabase
