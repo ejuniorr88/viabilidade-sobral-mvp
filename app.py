@@ -15,11 +15,11 @@ from pyproj import Transformer
 # =============================
 # Config
 # =============================
-st.set_page_config(layout="wide", page_title="Mapa de Zoneamento - Sobral")
-st.title("Mapa de Zoneamento - Sobral")
+st.set_page_config(layout="wide", page_title="Viabilidade")
+st.title("Viabilidade")
 
 DATA_DIR = Path("data")
-ZONE_FILE = DATA_DIR / "zoneamento.json"
+ZONE_FILE = DATA_DIR / "zoneamento_light.json"
 RUAS_FILE = DATA_DIR / "ruas.json"
 
 # WGS84 -> WebMercator (metros) (só para proximidade de ruas)
