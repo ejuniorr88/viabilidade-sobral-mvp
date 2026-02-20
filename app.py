@@ -161,54 +161,6 @@ def fmt_m2(x: Optional[float]) -> str:
         return "—"
 
 
-def parse_num(val) -> Optional[float]:
-    """
-    Converte strings tipo '1,5', '150 m²', '3 m', '30.0' em float.
-    Retorna None se não der.
-    """
-    if val is None:
-        return None
-    if isinstance(val, (int, float)):
-        return float(val)
-
-    s = str(val).strip()
-    if not s:
-        return None
-
-    # remove unidades e espaços
-    s = (
-        s.replace("m²", "")
-        .replace("m2", "")
-        .replace("m", "")
-        .replace("%", "")
-        .strip()
-    )
-
-    # normaliza decimal PT-BR
-    # se vier "62.500" (milhar) vira "62500"
-    # se vier "1,5" vira "1.5"
-    if "," in s and "." in s:
-        # assume "." como separador de milhar e "," como decimal
-        s = s.replace(".", "").replace(",", ".")
-    else:
-        s = s.replace(",", ".")
-
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-
-def get_zone_indicator(raw_zone: dict, key: str) -> str:
-    """Pega indicador do raw_zone e devolve string amigável."""
-    if not raw_zone:
-        return "—"
-    v = raw_zone.get(key)
-    if v in (None, "", "NULL"):
-        return "—"
-    return str(v)
-
-
 def popup_html(result: dict | None):
     if not result:
         return """
@@ -233,6 +185,93 @@ def popup_html(result: dict | None):
       <div><b>Hierarquia:</b> {hierarquia}</div>
     </div>
     """
+
+
+def envelope_area(
+    testada: float,
+    profundidade: float,
+    rec_fr: float,
+    rec_fun: float,
+    rec_lat: float,
+    esquina: bool,
+    corner_two_fronts: bool,
+    attach_one_side: bool,
+) -> Dict[str, Any]:
+    """
+    Retorna envelope (miolo) e dimensões úteis.
+
+    Meio de quadra:
+      largura_util = testada - (lat_esq + lat_dir)
+      prof_util    = profundidade - frontal - fundo
+
+    Esquina (simplificado):
+      - se corner_two_fronts=True: considera 2 frentes
+      - assume 1 lateral é "frente secundária" (usa rec_fr) e a outra é "lateral interna" (usa rec_lat)
+      - attach_one_side só zera a lateral interna (nunca a frente secundária)
+    """
+    testada = float(testada)
+    profundidade = float(profundidade)
+
+    rec_fr = float(rec_fr)
+    rec_fun = float(rec_fun)
+    rec_lat = float(rec_lat)
+
+    if not esquina:
+        lat_internal = rec_lat
+        lat_other = rec_lat
+        if attach_one_side:
+            lat_internal = 0.0
+
+        largura_util = max(testada - (lat_internal + lat_other), 0.0)
+        prof_util = max(profundidade - rec_fr - rec_fun, 0.0)
+        area = largura_util * prof_util
+        return {
+            "largura_util": largura_util,
+            "prof_util": prof_util,
+            "area_miolo": area,
+            "esquina_modelo": "meio_quadra",
+            "lat_internal": lat_internal,
+            "lat_other": lat_other,
+        }
+
+    # esquina
+    if corner_two_fronts:
+        lat_internal = rec_lat
+        if attach_one_side:
+            lat_internal = 0.0
+
+        # largura perde: lateral interna + frente secundária
+        largura_util = max(testada - (lat_internal + rec_fr), 0.0)
+
+        # profundidade perde: frente principal + fundo
+        prof_util = max(profundidade - rec_fr - rec_fun, 0.0)
+
+        area = largura_util * prof_util
+        return {
+            "largura_util": largura_util,
+            "prof_util": prof_util,
+            "area_miolo": area,
+            "esquina_modelo": "esquina_2_frentes",
+            "lat_internal": lat_internal,
+            "lat_other": rec_fr,  # aqui representa a “frente secundária”
+        }
+
+    # esquina mas sem considerar 2 frentes (vira meio de quadra)
+    lat_internal = rec_lat
+    lat_other = rec_lat
+    if attach_one_side:
+        lat_internal = 0.0
+    largura_util = max(testada - (lat_internal + lat_other), 0.0)
+    prof_util = max(profundidade - rec_fr - rec_fun, 0.0)
+    area = largura_util * prof_util
+    return {
+        "largura_util": largura_util,
+        "prof_util": prof_util,
+        "area_miolo": area,
+        "esquina_modelo": "esquina_sem_2_frentes",
+        "lat_internal": lat_internal,
+        "lat_other": lat_other,
+    }
 
 
 # =============================
@@ -404,11 +443,6 @@ def sb_list_use_types():
 
 @st.cache_data(show_spinner=False, ttl=300)
 def sb_get_zone_rule(zone_sigla: str, use_type_code: str) -> Optional[Dict[str, Any]]:
-    """
-    Select principal (adicione aqui campos do Supabase quando criar).
-    Mesmo se alguns campos não existirem no banco, o Supabase geralmente retorna erro.
-    Então mantemos um select simples e confiável.
-    """
     if not zone_sigla or not use_type_code:
         return None
 
@@ -448,7 +482,7 @@ def sb_get_parking_rule(use_type_code: str) -> Optional[Dict[str, Any]]:
 
 
 # =============================
-# Cálculos urbanísticos (MVP)
+# Cálculos urbanísticos
 # =============================
 def estimate_pavimentos(gabarito_pav: Optional[int], gabarito_m: Optional[float]) -> Optional[int]:
     try:
@@ -473,6 +507,8 @@ def compute_urbanism(
     testada: float,
     profundidade: float,
     esquina: bool,
+    corner_two_fronts: bool,
+    attach_one_side: bool,
     rule: Optional[Dict[str, Any]],
     park: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -485,6 +521,8 @@ def compute_urbanism(
         "testada": float(testada),
         "profundidade": float(profundidade),
         "esquina": bool(esquina),
+        "corner_two_fronts": bool(corner_two_fronts),
+        "attach_one_side": bool(attach_one_side),
         "area_lote": area_lote,
         "rule": rule,
         "park": park,
@@ -515,6 +553,7 @@ def compute_urbanism(
         calc["recuo_frontal_m"] = rec_fr
         calc["recuo_lateral_m"] = rec_lat
         calc["recuo_fundos_m"] = rec_fun
+
         calc["gabarito_m"] = g_m
         calc["gabarito_pav"] = g_pav
 
@@ -529,21 +568,30 @@ def compute_urbanism(
         calc["observacoes"] = rule.get("observacoes")
         calc["source_ref"] = rule.get("source_ref")
 
-        # miolo (recuos)
+        # Envelope por recuos (miolo) - AGORA considera esquina
         if rec_lat is not None and rec_fr is not None and rec_fun is not None:
-            largura_util = max(float(testada) - (2.0 * float(rec_lat)), 0.0)
-            prof_util = max(float(profundidade) - float(rec_fr) - float(rec_fun), 0.0)
-            area_miolo = largura_util * prof_util
+            env = envelope_area(
+                testada=testada,
+                profundidade=profundidade,
+                rec_fr=float(rec_fr),
+                rec_fun=float(rec_fun),
+                rec_lat=float(rec_lat),
+                esquina=bool(esquina),
+                corner_two_fronts=bool(corner_two_fronts),
+                attach_one_side=bool(attach_one_side),
+            )
+            calc["largura_util_miolo"] = env["largura_util"]
+            calc["prof_util_miolo"] = env["prof_util"]
+            calc["area_miolo"] = env["area_miolo"]
+            calc["esquina_modelo"] = env.get("esquina_modelo")
         else:
-            largura_util = None
-            prof_util = None
-            area_miolo = None
-
-        calc["largura_util_miolo"] = largura_util
-        calc["prof_util_miolo"] = prof_util
-        calc["area_miolo"] = area_miolo
+            calc["largura_util_miolo"] = None
+            calc["prof_util_miolo"] = None
+            calc["area_miolo"] = None
+            calc["esquina_modelo"] = None
 
         area_to = calc.get("area_max_ocupacao_to")
+        area_miolo = calc.get("area_miolo")
         if area_to is not None and area_miolo is not None:
             calc["area_max_ocupacao_real"] = min(float(area_to), float(area_miolo))
         else:
@@ -685,7 +733,13 @@ with col_panel:
 
     testada = st.number_input("Testada / Frente (m)", min_value=1.0, value=10.0, step=0.5)
     profundidade = st.number_input("Profundidade / Lateral (m)", min_value=1.0, value=30.0, step=0.5)
-    esquina = st.checkbox("Lote de esquina")
+
+    esquina = st.checkbox("Lote de esquina", value=False)
+    corner_two_fronts = True
+    attach_one_side = False
+
+    if esquina:
+        corner_two_fronts = st.checkbox("Considerar 2 frentes (esquina)", value=True)
 
     st.subheader("3) Calcular")
 
@@ -698,6 +752,14 @@ with col_panel:
             rule = sb_get_zone_rule(zona_sigla, use_code)
             park = sb_get_parking_rule(use_code)
 
+            allow_attach = bool((rule or {}).get("allow_attach_one_side") or False)
+
+            # se permitir encostar, pede opção
+            if allow_attach:
+                attach_one_side = st.checkbox("Encostar em 1 lateral (zerar recuo)", value=False, key="attach_now")
+            else:
+                attach_one_side = False
+
             calc = compute_urbanism(
                 zone_sigla=zona_sigla,
                 use_label=use_label,
@@ -705,6 +767,8 @@ with col_panel:
                 testada=float(testada),
                 profundidade=float(profundidade),
                 esquina=bool(esquina),
+                corner_two_fronts=bool(corner_two_fronts),
+                attach_one_side=bool(attach_one_side),
                 rule=rule,
                 park=park,
             )
@@ -716,7 +780,7 @@ with col_panel:
 
 
 # =============================
-# RESULTADOS (embaixo do mapa) – “leigo-friendly”
+# RESULTADOS
 # =============================
 res = st.session_state.get("res")
 calc = st.session_state.get("calc")
@@ -777,13 +841,6 @@ with c3:
         unsafe_allow_html=True,
     )
 
-if not (res.get("zona_sigla") or res.get("zona_nome")):
-    st.warning("Não encontrei zona para esse ponto (verifique se clicou dentro do município/zoneamento).")
-    with st.expander("Debug (raw)"):
-        st.write("zone raw:")
-        st.json(res.get("raw_zone") or {})
-    st.stop()
-
 rule = calc.get("rule")
 if not rule:
     st.warning(f"Sem regra cadastrada no Supabase para **{calc.get('zona_sigla')} + {calc.get('use_code')}**.")
@@ -791,14 +848,11 @@ if not rule:
     st.stop()
 
 # =============================
-# NOVO: Parâmetros detalhados (Supabase + GeoJSON)
+# Parâmetros detalhados (SÓ Supabase)
 # =============================
 st.divider()
 st.markdown("## Parâmetros da Zona (detalhado)")
 
-raw_zone = res.get("raw_zone") or {}
-
-# Supabase (zone_rules)
 to_max = rule.get("to_max")
 tp_min = rule.get("tp_min")
 ia_max = rule.get("ia_max")
@@ -823,7 +877,7 @@ with p1:
     st.markdown(
         f"""
         <div class="card">
-          <div class="pill">📌 Recuos (Supabase)</div>
+          <div class="pill">📌 Recuos</div>
           <div class="muted">Frontal</div><div class="big">{fmt_m(rec_fr)}</div>
           <div class="muted">Lateral</div><div class="big">{fmt_m(rec_lat)}</div>
           <div class="muted">Fundo</div><div class="big">{fmt_m(rec_fun)}</div>
@@ -838,7 +892,7 @@ with p2:
     st.markdown(
         f"""
         <div class="card">
-          <div class="pill">📊 Índices (Supabase)</div>
+          <div class="pill">📊 Índices</div>
           <div class="muted">TO (máx)</div><div class="big">{fmt_pct(to_max)}</div>
           <div class="muted">TP/Permeabilidade (mín)</div><div class="big">{fmt_pct(tp_min)}</div>
           <div class="muted">IA (mín)</div><div class="big">{ia_min if ia_min is not None else "—"}</div>
@@ -858,7 +912,7 @@ with p3:
     st.markdown(
         f"""
         <div class="card">
-          <div class="pill">📏 Lote / Altura (Supabase)</div>
+          <div class="pill">📏 Lote / Altura</div>
           <div class="muted">Área mínima</div><div class="big">{fmt_m2(area_min_lote)}</div>
           <div class="muted">Testada mín. (meio)</div><div class="big">{fmt_m(testada_min_meio)}</div>
           <div class="muted">Testada mín. (esquina)</div><div class="big">{fmt_m(testada_min_esquina)}</div>
@@ -869,89 +923,8 @@ with p3:
         unsafe_allow_html=True,
     )
 
-# GeoJSON (indicadores do zoneamento)
-geo_to = parse_num(get_zone_indicator(raw_zone, "taxa_ocu"))
-geo_tp = parse_num(get_zone_indicator(raw_zone, "taxa_perm"))
-geo_ia = parse_num(get_zone_indicator(raw_zone, "indice_apr"))
-
-geo_rec_fr = get_zone_indicator(raw_zone, "rec_frente")
-geo_rec_fun = get_zone_indicator(raw_zone, "rec_fundo")
-geo_rec_lat = get_zone_indicator(raw_zone, "rec_latera")
-
-geo_area_min = get_zone_indicator(raw_zone, "area_min_l")
-geo_testada_min = get_zone_indicator(raw_zone, "testada_mi")
-geo_altura_max = get_zone_indicator(raw_zone, "altura_max")
-
-st.markdown("### Indicadores do Zoneamento (GeoJSON)")
-gz1, gz2, gz3 = st.columns(3)
-
-with gz1:
-    st.markdown(
-        f"""
-        <div class="card">
-          <div class="pill">🧾 Índices (GeoJSON)</div>
-          <div class="muted">Taxa de Ocupação</div><div class="big">{(str(int(geo_to)) + "%") if geo_to is not None else "—"}</div>
-          <div class="muted">Taxa de Permeabilidade</div><div class="big">{(str(int(geo_tp)) + "%") if geo_tp is not None else "—"}</div>
-          <div class="muted">Índice de Aproveitamento</div><div class="big">{geo_ia if geo_ia is not None else "—"}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with gz2:
-    st.markdown(
-        f"""
-        <div class="card">
-          <div class="pill">📐 Recuos (GeoJSON)</div>
-          <div class="muted">Frontal</div><div class="big">{geo_rec_fr}</div>
-          <div class="muted">Lateral</div><div class="big">{geo_rec_lat}</div>
-          <div class="muted">Fundo</div><div class="big">{geo_rec_fun}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with gz3:
-    st.markdown(
-        f"""
-        <div class="card">
-          <div class="pill">🏡 Lote / Altura (GeoJSON)</div>
-          <div class="muted">Área mínima</div><div class="big">{geo_area_min}</div>
-          <div class="muted">Testada mínima</div><div class="big">{geo_testada_min}</div>
-          <div class="muted">Altura máxima</div><div class="big">{geo_altura_max}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-st.markdown("### Conferência rápida (Supabase x GeoJSON)")
-cmp = []
-if to_max is not None and geo_to is not None:
-    cmp.append(f"• TO: Supabase {fmt_pct(to_max)} vs GeoJSON {int(geo_to)}%")
-if tp_min is not None and geo_tp is not None:
-    cmp.append(f"• TP: Supabase {fmt_pct(tp_min)} vs GeoJSON {int(geo_tp)}%")
-if ia_max is not None and geo_ia is not None:
-    cmp.append(f"• IA máx: Supabase {ia_max} vs GeoJSON {geo_ia}")
-
-if cmp:
-    st.info("\n".join(cmp))
-else:
-    st.caption("Sem dados suficientes para comparar.")
-
-# info de encostar (texto simples)
-if allow_attach and calc.get("use_code") == "RES_UNI":
-    st.markdown(
-        "<div class='ok'><b>✅ Encostar em 1 lateral</b><br/>"
-        "Esta zona (para este uso) permite <b>zerar 1 recuo lateral</b>. "
-        "Na próxima etapa a gente vai mostrar <b>2 cenários</b> (normal x encostando) no resultado.</div>",
-        unsafe_allow_html=True,
-    )
-
-if rule.get("notes"):
-    st.markdown("<div class='warn'><b>Observação da regra</b><br/>" + str(rule.get("notes")) + "</div>", unsafe_allow_html=True)
-
 # =============================
-# Resultado leigo-friendly (mantido)
+# Resumo leigo-friendly
 # =============================
 st.divider()
 st.markdown("## Resumo do que você pode fazer (modo simples)")
@@ -964,12 +937,18 @@ pavs = calc.get("pavimentos_estimados")
 g_pav = calc.get("gabarito_pav")
 g_m = calc.get("gabarito_m")
 
+extra_corner = ""
+if calc.get("esquina"):
+    modelo = calc.get("esquina_modelo") or "—"
+    extra_corner = f"<div class='muted' style='margin-top:6px;'>Modelo de esquina usado: <b>{modelo}</b></div>"
+
 st.markdown(
     f"""
     <div class="card">
       <h4>✅ Ocupação no térreo</h4>
       <div class="big">Seu lote tem {fmt_m2(calc.get("area_lote"))}. No térreo, você pode ocupar até {fmt_m2(area_terreo)}.</div>
       <div class="muted">Esse limite considera TO e recuos (a regra mais restritiva vence).</div>
+      {extra_corner}
     </div>
     """,
     unsafe_allow_html=True,
@@ -979,7 +958,7 @@ st.markdown(
     f"""
     <div class="card" style="margin-top:12px;">
       <h4>🌿 Área permeável</h4>
-      <div class="big">Você precisa deixar {fmt_m2(area_perm)} permeável (área que absorve água).</div>
+      <div class="big">Você precisa deixar {fmt_m2(area_perm)} permeável.</div>
       <div class="muted">Ex.: jardins, solo natural, áreas drenantes (depende do que a prefeitura aceita).</div>
     </div>
     """,
@@ -1044,16 +1023,6 @@ with colC:
         unsafe_allow_html=True,
     )
 
-area_to = calc.get("area_max_ocupacao_to")
-area_miolo = calc.get("area_miolo")
-if area_to is not None and area_miolo is not None:
-    if float(area_miolo) < float(area_to):
-        st.caption("➡️ Aqui quem manda são os **recuos**: o miolo ficou menor que o limite por TO.")
-    else:
-        st.caption("➡️ Aqui quem manda é a **TO**: o limite por TO ficou menor que o miolo.")
-else:
-    st.caption("➡️ Para comparar TO x miolo, é preciso ter TO e recuos cadastrados nessa regra.")
-
 if calc.get("vagas_min") is not None:
     st.divider()
     st.markdown("## Vagas mínimas")
@@ -1068,7 +1037,9 @@ if calc.get("vagas_min") is not None:
         unsafe_allow_html=True,
     )
 
-# Observações (mantenho as duas: observacoes + notes)
+if calc.get("notes"):
+    st.markdown("<div class='warn'><b>Observação</b><br/>" + str(calc.get("notes")) + "</div>", unsafe_allow_html=True)
+
 if calc.get("observacoes"):
     st.divider()
     st.markdown("## Observações")
