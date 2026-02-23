@@ -69,31 +69,23 @@ st.markdown(
         border-radius: 12px;
         margin-top: 10px;
       }
-      .note {
-        background: rgba(108, 117, 125, 0.08);
-        border: 1px solid rgba(108, 117, 125, 0.18);
-        padding: 10px 12px;
-        border-radius: 12px;
-        margin-top: 10px;
+      .side-title {
+        font-size: 15px;
+        font-weight: 800;
+        margin-top: 6px;
+        margin-bottom: 8px;
       }
-      .note ul { margin: 6px 0 0 18px; }
+      .side-block {
+        background: rgba(49, 51, 63, 0.03);
+        border: 1px solid rgba(49, 51, 63, 0.08);
+        border-radius: 12px;
+        padding: 12px;
+        margin-bottom: 12px;
+      }
     </style>
     """,
     unsafe_allow_html=True,
 )
-
-
-# =============================
-# Observações (Anexo IV – Estacionamento)
-# =============================
-PARKING_NOTES_GENERAL = [
-    "Arredondamento: quando o cálculo gerar fração com decimal ≥ 0,5, arredonda para o número inteiro imediatamente superior.",
-    "Até 30% das vagas previstas podem ser destinadas a motocicletas.",
-]
-PARKING_NOTES_RES_MULTI = [
-    "Residência multifamiliar: 1 vaga por apartamento quando a unidade for < 90 m²; e 1,5 vaga por apartamento quando a unidade for ≥ 90 m² (Anexo IV).",
-    "Para calcular automaticamente, informe a quantidade de apartamentos e a área média da unidade.",
-]
 
 
 # =============================
@@ -217,6 +209,19 @@ def envelope_area(
     corner_two_fronts: bool,
     attach_one_side: bool,
 ) -> Dict[str, Any]:
+    """
+    Envelope por recuos.
+
+    Meio de quadra:
+      largura_util = testada - (lat_esq + lat_dir)
+      prof_util    = profundidade - frontal - fundo
+
+    Esquina:
+      - se corner_two_fronts=True: considera 2 frentes
+      - assume 1 lado vira "frente secundária" (usa rec_fr)
+      - a outra é "lateral interna" (usa rec_lat)
+      - attach_one_side só zera a lateral interna (nunca a frente secundária)
+    """
     testada = float(testada)
     profundidade = float(profundidade)
     rec_fr = float(rec_fr)
@@ -321,7 +326,7 @@ def find_zone_for_click(zone_index, lat: float, lon: float):
     props_list = zone_index["props"]
     gid = zone_index["gid"]
 
-    if _tree_returns_indices(candidates):
+    if _tree_returns_indices(candidates):  # Shapely 2: índices
         for i in candidates:
             try:
                 i = int(i)
@@ -331,7 +336,7 @@ def find_zone_for_click(zone_index, lat: float, lon: float):
                 continue
         return None
 
-    for g in candidates:
+    for g in candidates:  # Shapely 1.x: geometrias
         i = gid.get(id(g))
         if i is None:
             continue
@@ -430,49 +435,32 @@ def sb_list_use_types():
 @st.cache_data(show_spinner=False, ttl=300)
 def sb_get_zone_rule(zone_sigla: str, use_type_code: str) -> Optional[Dict[str, Any]]:
     """
-    Busca regra por:
-      1) (zona + uso selecionado)
-      2) fallback p/ RES_UNI quando uso = RES_MULTI (parâmetros iguais, conforme você informou)
-      3) fallback p/ ANY (genérico do sistema)
+    Busca regra exata.
+    (Obs: a gente NÃO usa "ANY" aqui porque a FK em use_types impede.
+    Se quiser fallback automático futuramente, melhor criar uma tabela de "defaults" por zona.)
     """
     if not zone_sigla or not use_type_code:
         return None
 
-    def _fetch(zsigla: str, ucode: str) -> Optional[Dict[str, Any]]:
-        res = (
-            sb.table("zone_rules")
-            .select(
-                "zone_sigla,use_type_code,"
-                "to_max,tp_min,ia_min,ia_max,to_sub_max,"
-                "recuo_frontal_m,recuo_lateral_m,recuo_fundos_m,"
-                "gabarito_m,gabarito_pav,"
-                "area_min_lote_m2,area_max_lote_m2,"
-                "testada_min_meio_m,testada_min_esquina_m,testada_max_m,"
-                "allow_attach_one_side,notes,special_area_tag,"
-                "observacoes,source_ref,requires_subzone,subzone_code"
-            )
-            .eq("zone_sigla", zsigla)
-            .eq("use_type_code", ucode)
-            .limit(1)
-            .execute()
+    res = (
+        sb.table("zone_rules")
+        .select(
+            "zone_sigla,use_type_code,"
+            "to_max,tp_min,ia_min,ia_max,to_sub_max,"
+            "recuo_frontal_m,recuo_lateral_m,recuo_fundos_m,"
+            "gabarito_m,gabarito_pav,"
+            "area_min_lote_m2,area_max_lote_m2,"
+            "testada_min_meio_m,testada_min_esquina_m,testada_max_m,"
+            "allow_attach_one_side,notes,special_area_tag,"
+            "observacoes,source_ref,requires_subzone,subzone_code"
         )
-        data = res.data or []
-        return data[0] if data else None
-
-    rule = _fetch(zone_sigla, use_type_code)
-    if rule:
-        return rule
-
-    if use_type_code == "RES_MULTI":
-        rule = _fetch(zone_sigla, "RES_UNI")
-        if rule:
-            return rule
-
-    rule = _fetch(zone_sigla, "ANY")
-    if rule:
-        return rule
-
-    return None
+        .eq("zone_sigla", zone_sigla)
+        .eq("use_type_code", use_type_code)
+        .limit(1)
+        .execute()
+    )
+    data = res.data or []
+    return data[0] if data else None
 
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -620,7 +608,7 @@ def compute_urbanism(
         calc["pavimentos_estimados"] = estimate_pavimentos(g_pav, g_m)
 
     # =============================
-    # Vagas
+    # Vagas (json_rule + modo opcional)
     # =============================
     vagas = None
     vagas_texto = None
@@ -717,6 +705,121 @@ if "attach_one_side" not in st.session_state:
 
 
 # =============================
+# Catálogo de usos (Categoria + Busca)
+# =============================
+def fallback_use_catalog():
+    # fallback (caso use_types ainda não esteja completo)
+    return {
+        "Residencial": [
+            ("Residencial Unifamiliar (Casa)", "RES_UNI"),
+            ("Residencial Multifamiliar (Prédio)", "RES_MULTI"),
+        ],
+        "Comercial": [
+            ("Comércio Varejista / Loja", "COM_VAREJO"),
+            ("Comércio Atacadista / Depósitos", "COM_ATACADO"),
+            ("Shopping Centers", "SHOPPING"),
+        ],
+        "Serviço": [
+            ("Prestação de Serviços em Geral", "SERV_GERAL"),
+            ("Serviços Bancários e Financeiros", "SERV_BANCO"),
+            ("Serviços de Alimentação", "SERV_ALIMENT"),
+            ("Serviços de Utilidade Pública", "SERV_UTIL"),
+            ("Serviços Automotivos", "SERV_AUTO"),
+            ("Hospedagem", "HOSPEDAGEM"),
+        ],
+        "Saúde/Educação": [
+            ("Serviços na Área Educacional", "EDU"),
+            ("Unidades de Saúde com Internação", "SAUDE_INT"),
+            ("Unidades de Saúde sem Internação", "SAUDE_SINT"),
+        ],
+        "Industrial/Outros": [
+            ("Indústrias", "INDUSTRIA"),
+            ("Templos Religiosos", "TEMPLO"),
+            ("Estádios / Ginásios / Teatros", "ESTADIO"),
+        ]
+    }
+
+
+def build_use_catalog_from_db(use_types_rows: list[dict]) -> Dict[str, list[tuple[str, str]]]:
+    # Espera que use_types tenha category preenchido.
+    catalog: Dict[str, list[tuple[str, str]]] = {}
+    for r in use_types_rows or []:
+        code = r.get("code")
+        label = r.get("label")
+        cat = r.get("category") or "Outros"
+        if not code or not label:
+            continue
+        catalog.setdefault(cat, []).append((label, code))
+
+    # ordena labels dentro da categoria
+    for cat in list(catalog.keys()):
+        catalog[cat] = sorted(catalog[cat], key=lambda x: x[0].lower())
+
+    # se vier vazio, fallback
+    if not catalog:
+        return fallback_use_catalog()
+
+    return catalog
+
+
+use_types_rows = sb_list_use_types()
+use_catalog = build_use_catalog_from_db(use_types_rows)
+
+# lista "global" para Busca Direta
+ALL_USES: list[tuple[str, str, str]] = []
+for cat, items in use_catalog.items():
+    for (label, code) in items:
+        ALL_USES.append((label, code, cat))
+ALL_USES = sorted(ALL_USES, key=lambda x: (x[2].lower(), x[0].lower()))
+
+
+# =============================
+# Sidebar (igual às imagens)
+# =============================
+with st.sidebar:
+    st.markdown("<div class='side-block'>", unsafe_allow_html=True)
+    st.markdown("### 1. Escolha o Uso")
+    categories = list(use_catalog.keys())
+    selected_cat = st.selectbox("Categoria:", categories, index=categories.index("Residencial") if "Residencial" in categories else 0)
+
+    options_in_cat = use_catalog.get(selected_cat, [])
+    if not options_in_cat:
+        st.warning("Sem opções nesta categoria.")
+        st.stop()
+
+    labels_cat = [x[0] for x in options_in_cat]
+    label_in_cat = st.selectbox("Opções na Categoria:", labels_cat, index=0)
+    use_label_cat = label_in_cat
+    use_code_cat = dict(options_in_cat)[label_in_cat]
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='side-block'>", unsafe_allow_html=True)
+    st.markdown("### 2. Busca Direta")
+    all_labels = [f"{lbl}  •  {cat}" for (lbl, _, cat) in ALL_USES]
+    selected_global = st.selectbox("Ou digite para pesquisar:", all_labels, index=0, help="Você pode digitar para filtrar.")
+    idx = all_labels.index(selected_global)
+    use_label_global, use_code_global, use_cat_global = ALL_USES[idx]
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Fonte de verdade do uso: se a pessoa mexer na busca direta, ela escolhe por lá.
+    # Regra simples: se o usuário selecionou algum item, usamos a Busca Direta.
+    # (Como Streamlit sempre tem um "selected", isso vira sempre a busca direta.
+    # Então aqui vamos usar: se categoria == cat do item e label igual, mantém; senão, usa o da categoria.)
+    # Para simplificar: vamos priorizar a categoria/itens, e a Busca Direta serve para "atalho" quando o usuário quiser.
+    # -> Use um checkbox "Usar Busca Direta".
+    use_search_direct = st.checkbox("Usar seleção da Busca Direta", value=False)
+
+    if use_search_direct:
+        use_label = use_label_global
+        use_code = use_code_global
+        use_cat = use_cat_global
+    else:
+        use_label = use_label_cat
+        use_code = use_code_cat
+        use_cat = selected_cat
+
+
+# =============================
 # Layout (Mapa + Painel)
 # =============================
 col_map, col_panel = st.columns([3, 1], gap="large")
@@ -763,9 +866,8 @@ with col_map:
             st.session_state["calc"] = None
             st.rerun()
 
-
 with col_panel:
-    st.subheader("1) Marque o lote no mapa")
+    st.subheader("Selecione o lote no mapa")
 
     click = st.session_state["click"]
     if not click:
@@ -777,22 +879,8 @@ with col_panel:
     st.write("**Coordenadas clicadas**")
     st.code(f"lat: {lat:.6f}\nlon: {lon:.6f}", language="text")
 
-    st.subheader("2) Dados do lote/projeto")
-
-    use_types = sb_list_use_types()
-    use_options = {
-        u["label"]: u["code"]
-        for u in use_types
-        if u.get("category") == "Residencial" and u.get("code") != "ANY"
-    }
-    if not use_options:
-        use_options = {
-            "Residencial Unifamiliar (Casa)": "RES_UNI",
-            "Residencial Multifamiliar (Prédio)": "RES_MULTI",
-        }
-
-    use_label = st.selectbox("Escolha o uso", list(use_options.keys()))
-    use_code = use_options[use_label]
+    st.subheader("Dados do lote/projeto")
+    st.write(f"**Uso selecionado:** {use_label}")
 
     testada = st.number_input("Testada / Frente (m)", min_value=1.0, value=10.0, step=0.5)
     profundidade = st.number_input("Profundidade / Lateral (m)", min_value=1.0, value=30.0, step=0.5)
@@ -802,7 +890,7 @@ with col_panel:
     if esquina:
         corner_two_fronts = st.checkbox("Considerar 2 frentes (esquina)", value=True)
 
-    # ✅ Multifamiliar (opcional) — só aparece em RES_MULTI
+    # ✅ Multifamiliar (opcional) — APARECE SOMENTE se for RES_MULTI
     qtd_unidades = None
     area_unidade_m2 = None
     if use_code == "RES_MULTI":
@@ -812,21 +900,27 @@ with col_panel:
         qtd_unidades = int(qtd_u) if qtd_u and qtd_u > 0 else None
         area_unidade_m2 = float(area_u) if area_u and area_u > 0 else None
 
-    # ✅ Encostar: agora RES_MULTI segue a mesma regra (depende do allow_attach_one_side)
+    # Encostar (desabilitado para RES_MULTI por enquanto)
     last_calc = st.session_state.get("calc") or {}
     last_rule = (last_calc.get("rule") or {}) if isinstance(last_calc, dict) else {}
     allow_attach_last = bool(last_rule.get("allow_attach_one_side") or False)
 
+    disable_attach = (use_code == "RES_MULTI") or (not allow_attach_last)
+
+    help_attach = "Só habilita depois que você calcular uma zona que permita encostar em 1 lateral."
+    if use_code == "RES_MULTI":
+        help_attach = "Por segurança, está desabilitado para Multifamiliar. Se a lei permitir, a gente reativa."
+
     st.session_state["attach_one_side"] = st.checkbox(
         "Encostar em 1 lateral (zerar recuo)",
         value=bool(st.session_state.get("attach_one_side", False)),
-        disabled=not allow_attach_last,
-        help="Só habilita depois que você calcular uma zona que permita encostar em 1 lateral."
+        disabled=disable_attach,
+        help=help_attach
     )
 
-    st.subheader("3) Calcular")
+    st.subheader("Calcular")
 
-    if st.button("🧮 Calcular", use_container_width=True):
+    if st.button("🚀 GERAR ESTUDO DE VIABILIDADE", use_container_width=True):
         with st.spinner("Calculando..."):
             res = compute_location(zone_index, ruas_index, lat, lon)
             st.session_state["res"] = res
@@ -837,6 +931,10 @@ with col_panel:
 
             allow_attach_now = bool((rule or {}).get("allow_attach_one_side") or False)
             attach_one_side = bool(st.session_state.get("attach_one_side", False)) and allow_attach_now
+
+            # trava para RES_MULTI (por enquanto)
+            if use_code == "RES_MULTI":
+                attach_one_side = False
 
             calc = compute_urbanism(
                 zone_sigla=zona_sigla,
@@ -856,7 +954,7 @@ with col_panel:
 
         st.rerun()
 
-    st.caption("💡 Dica: o pin aparece na hora. O cálculo acontece só quando você clicar em **Calcular**.")
+    st.caption("💡 Dica: o pin aparece na hora. O cálculo acontece só quando você clicar em **Gerar Estudo**.")
 
 
 # =============================
@@ -869,7 +967,7 @@ st.divider()
 st.markdown("## Resultados")
 
 if not res or not calc:
-    st.caption("Clique no mapa, preencha os dados e depois clique em **Calcular** para ver os resultados aqui embaixo.")
+    st.caption("Clique no mapa, preencha os dados e clique em **Gerar Estudo** para ver os resultados.")
     st.stop()
 
 c1, c2, c3 = st.columns(3)
@@ -929,7 +1027,7 @@ if not rule:
 
 
 # =============================
-# Parâmetros da Zona
+# Parâmetros da Zona (detalhado)
 # =============================
 st.divider()
 st.markdown("## Parâmetros da Zona (detalhado)")
@@ -1016,7 +1114,7 @@ if rule.get("requires_subzone"):
         "<div class='warn'><b>⚠ Zona com subzona/setor</b><br/>"
         "Essa zona tem parâmetros por <b>setor/subzona</b>. "
         "Por enquanto você está usando uma regra <b>genérica</b>. "
-        "Quando quiser, a gente adiciona seleção de setor no app.</div>",
+        "Quando quiser, a gente adiciona seleção de setor no app (ZEIS 1/2/3, ZPP 1/2/3, ZEIA 1/2/3/APP, ZEIP 1..9, ZEPE 1/2).</div>",
         unsafe_allow_html=True,
     )
 
@@ -1104,6 +1202,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
 # =============================
 # Vagas mínimas
 # =============================
@@ -1138,15 +1237,18 @@ elif calc.get("vagas_texto"):
 else:
     st.caption("Sem regra de estacionamento cadastrada para este uso.")
 
-# Observações importantes
-notes = list(PARKING_NOTES_GENERAL)
-if calc.get("use_code") == "RES_MULTI":
-    notes.extend(PARKING_NOTES_RES_MULTI)
-
+# Observações gerais (Anexo IV)
 st.markdown(
-    "<div class='note'><b>Observações importantes (Anexo IV)</b><ul>"
-    + "".join([f"<li>{n}</li>" for n in notes])
-    + "</ul></div>",
+    """
+    <div class="warn">
+      <b>Observações importantes (estacionamento – Anexo IV)</b><br/>
+      • <b>Arredondamento:</b> quando o resultado tiver fração com décimo ≥ 0,5, arredonda para o número inteiro superior.<br/>
+      • <b>Motos:</b> até <b>30%</b> das vagas previstas podem ser destinadas a motocicletas.<br/>
+      • <b>VLT:</b> pode haver redução de até <b>20%</b> das vagas (uso não residencial) se estiver em raio de 250m de estação de VLT (quando aplicável).<br/>
+      • <b>Via local (não residencial):</b> até 100m² de área útil pode ser dispensado de vagas (quando aplicável).<br/>
+      • <b>Tombamento:</b> pode haver dispensa se houver impossibilidade comprovada (quando aplicável).<br/>
+    </div>
+    """,
     unsafe_allow_html=True,
 )
 
