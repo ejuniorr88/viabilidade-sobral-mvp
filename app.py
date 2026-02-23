@@ -424,28 +424,53 @@ def sb_list_use_types():
 
 @st.cache_data(show_spinner=False, ttl=300)
 def sb_get_zone_rule(zone_sigla: str, use_type_code: str) -> Optional[Dict[str, Any]]:
+    """
+    Busca regra por:
+      1) (zona + uso selecionado)
+      2) fallback p/ RES_UNI quando uso = RES_MULTI (porque você disse que os parâmetros são os mesmos)
+      3) fallback p/ ANY (genérico do sistema)
+    """
     if not zone_sigla or not use_type_code:
         return None
 
-    res = (
-        sb.table("zone_rules")
-        .select(
-            "zone_sigla,use_type_code,"
-            "to_max,tp_min,ia_min,ia_max,to_sub_max,"
-            "recuo_frontal_m,recuo_lateral_m,recuo_fundos_m,"
-            "gabarito_m,gabarito_pav,"
-            "area_min_lote_m2,area_max_lote_m2,"
-            "testada_min_meio_m,testada_min_esquina_m,testada_max_m,"
-            "allow_attach_one_side,notes,special_area_tag,"
-            "observacoes,source_ref,requires_subzone,subzone_code"
+    def _fetch(zsigla: str, ucode: str) -> Optional[Dict[str, Any]]:
+        res = (
+            sb.table("zone_rules")
+            .select(
+                "zone_sigla,use_type_code,"
+                "to_max,tp_min,ia_min,ia_max,to_sub_max,"
+                "recuo_frontal_m,recuo_lateral_m,recuo_fundos_m,"
+                "gabarito_m,gabarito_pav,"
+                "area_min_lote_m2,area_max_lote_m2,"
+                "testada_min_meio_m,testada_min_esquina_m,testada_max_m,"
+                "allow_attach_one_side,notes,special_area_tag,"
+                "observacoes,source_ref,requires_subzone,subzone_code"
+            )
+            .eq("zone_sigla", zsigla)
+            .eq("use_type_code", ucode)
+            .limit(1)
+            .execute()
         )
-        .eq("zone_sigla", zone_sigla)
-        .eq("use_type_code", use_type_code)
-        .limit(1)
-        .execute()
-    )
-    data = res.data or []
-    return data[0] if data else None
+        data = res.data or []
+        return data[0] if data else None
+
+    # 1) exata
+    rule = _fetch(zone_sigla, use_type_code)
+    if rule:
+        return rule
+
+    # 2) fallback: multifamiliar usa a mesma regra do unifamiliar (se você ainda não cadastrou RES_MULTI)
+    if use_type_code == "RES_MULTI":
+        rule = _fetch(zone_sigla, "RES_UNI")
+        if rule:
+            return rule
+
+    # 3) fallback: ANY (se existir no use_types e zone_rules)
+    rule = _fetch(zone_sigla, "ANY")
+    if rule:
+        return rule
+
+    return None
 
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -758,7 +783,14 @@ with col_panel:
     st.subheader("2) Dados do lote/projeto")
 
     use_types = sb_list_use_types()
-    use_options = {u["label"]: u["code"] for u in use_types if u.get("category") == "Residencial"}
+
+    # ✅ NÃO mostrar "ANY" na UI
+    use_options = {
+        u["label"]: u["code"]
+        for u in use_types
+        if u.get("category") == "Residencial" and u.get("code") != "ANY"
+    }
+
     if not use_options:
         use_options = {
             "Residencial Unifamiliar (Casa)": "RES_UNI",
