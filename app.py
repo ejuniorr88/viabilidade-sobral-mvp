@@ -956,7 +956,7 @@ with col_panel:
             zona_sigla = res.get("zona_sigla") or ""
 
             # ✅ regra com fallback (RES_MULTI -> RES_UNI)
-            rule, used_fallback = sb_get_zone_rule_with_fallback(zona_sigla, use_code)
+            rule = sb_get_zone_rule(zona_sigla, use_code)
 
             park = sb_get_parking_rule(use_code)
 
