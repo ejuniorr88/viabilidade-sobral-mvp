@@ -70,17 +70,14 @@ st.markdown(
         margin-top: 10px;
       }
       .side-title {
-        font-size: 15px;
         font-weight: 800;
-        margin-top: 6px;
-        margin-bottom: 8px;
+        font-size: 18px;
+        margin: 4px 0 10px 0;
       }
-      .side-block {
-        background: rgba(49, 51, 63, 0.03);
-        border: 1px solid rgba(49, 51, 63, 0.08);
-        border-radius: 12px;
-        padding: 12px;
-        margin-bottom: 12px;
+      .hr-soft {
+        height: 1px;
+        background: rgba(49, 51, 63, 0.10);
+        margin: 14px 0;
       }
     </style>
     """,
@@ -178,7 +175,7 @@ def popup_html(result: dict | None):
         return """
         <div style="font-family: Arial, sans-serif; font-size: 13px; line-height: 1.35; min-width:260px;">
           <div style="font-weight:700; font-size:14px; margin-bottom:6px;">Ponto selecionado</div>
-          <div style="color:#666;">Preencha os dados e clique em <b>Calcular</b> para ver zona, rua e índices.</div>
+          <div style="color:#666;">Preencha os dados e clique em <b>Gerar estudo</b> para ver zona, rua e parâmetros.</div>
         </div>
         """
 
@@ -255,6 +252,7 @@ def envelope_area(
             "esquina_modelo": "esquina_2_frentes",
         }
 
+    # esquina sem 2 frentes => comportamento meio de quadra
     lat_internal = rec_lat
     lat_other = rec_lat
     if attach_one_side:
@@ -326,7 +324,8 @@ def find_zone_for_click(zone_index, lat: float, lon: float):
     props_list = zone_index["props"]
     gid = zone_index["gid"]
 
-    if _tree_returns_indices(candidates):  # Shapely 2: índices
+    # Shapely 2: índices
+    if _tree_returns_indices(candidates):
         for i in candidates:
             try:
                 i = int(i)
@@ -336,7 +335,8 @@ def find_zone_for_click(zone_index, lat: float, lon: float):
                 continue
         return None
 
-    for g in candidates:  # Shapely 1.x: geometrias
+    # Shapely 1.x: geometrias
+    for g in candidates:
         i = gid.get(id(g))
         if i is None:
             continue
@@ -428,17 +428,12 @@ def compute_location(zone_index, ruas_index, lat: float, lon: float):
 # =============================
 @st.cache_data(show_spinner=False, ttl=300)
 def sb_list_use_types():
-    res = sb.table("use_types").select("code,label,category").eq("is_active", True).order("label").execute()
+    res = sb.table("use_types").select("code,label,category,is_active").eq("is_active", True).order("label").execute()
     return res.data or []
 
 
 @st.cache_data(show_spinner=False, ttl=300)
 def sb_get_zone_rule(zone_sigla: str, use_type_code: str) -> Optional[Dict[str, Any]]:
-    """
-    Busca regra exata.
-    (Obs: a gente NÃO usa "ANY" aqui porque a FK em use_types impede.
-    Se quiser fallback automático futuramente, melhor criar uma tabela de "defaults" por zona.)
-    """
     if not zone_sigla or not use_type_code:
         return None
 
@@ -464,9 +459,34 @@ def sb_get_zone_rule(zone_sigla: str, use_type_code: str) -> Optional[Dict[str, 
 
 
 @st.cache_data(show_spinner=False, ttl=300)
+def sb_get_zone_rule_with_fallback(zone_sigla: str, use_type_code: str) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """
+    ✅ Fallback profissional:
+    - Se RES_MULTI não tiver regra cadastrada, tenta RES_UNI (pois você confirmou que os recuos/índices são os mesmos).
+    Retorna (rule, used_fallback).
+    """
+    rule = sb_get_zone_rule(zone_sigla, use_type_code)
+    if rule:
+        return rule, False
+
+    if use_type_code == "RES_MULTI":
+        fallback = sb_get_zone_rule(zone_sigla, "RES_UNI")
+        if fallback:
+            # marca que veio por fallback (sem mudar no banco)
+            fallback = dict(fallback)
+            fallback["notes"] = (fallback.get("notes") or "")
+            extra = "⚠ Parâmetros exibidos usando fallback: RES_UNI (mesmos índices/recuos do multifamiliar, conforme configuração do sistema)."
+            fallback["notes"] = (fallback["notes"] + "\n\n" + extra).strip()
+            return fallback, True
+
+    return None, False
+
+
+@st.cache_data(show_spinner=False, ttl=300)
 def sb_get_parking_rule(use_type_code: str) -> Optional[Dict[str, Any]]:
     if not use_type_code:
         return None
+    # ✅ inclui rule_json para as regras "json_rule" (multifamiliar)
     res = (
         sb.table("parking_rules")
         .select("use_type_code,metric,value,min_vagas,source_ref,rule_json")
@@ -577,6 +597,7 @@ def compute_urbanism(
         calc["observacoes"] = rule.get("observacoes")
         calc["source_ref"] = rule.get("source_ref")
 
+        # Envelope (miolo)
         if rec_lat is not None and rec_fr is not None and rec_fun is not None:
             env = envelope_area(
                 testada=testada,
@@ -608,16 +629,24 @@ def compute_urbanism(
         calc["pavimentos_estimados"] = estimate_pavimentos(g_pav, g_m)
 
     # =============================
-    # Vagas (json_rule + modo opcional)
+    # ✅ Vagas (json_rule + modo opcional)
     # =============================
     vagas = None
     vagas_texto = None
+    parking_notes = []
 
     if park:
         metric = park.get("metric")
         value = park.get("value") or 0
         min_v = park.get("min_vagas")
         rule_json = park.get("rule_json") or {}
+
+        # Observações importantes (Anexo IV) — deixa “profissional”
+        # (você pode depois mover isso pro banco, mas assim já entrega valor agora)
+        parking_notes.extend([
+            "Arredondamento: quando der fração com décimos ≥ 0,5, arredonda para o inteiro imediatamente superior.",
+            "Até 30% das vagas previstas podem ser destinadas a motocicletas.",
+        ])
 
         if metric == "fixed":
             try:
@@ -643,7 +672,11 @@ def compute_urbanism(
             rtype = (rule_json or {}).get("type")
 
             if rtype == "per_unit_by_unit_area":
-                vagas_texto = (rule_json or {}).get("display_text")
+                # texto SEMPRE aparece (cálculo só se tiver inputs)
+                vagas_texto = (rule_json or {}).get("display_text") or (
+                    "Residência multifamiliar: 1 vaga por apartamento quando < 90m²; "
+                    "e 1,5 vaga por apartamento quando ≥ 90m²."
+                )
 
                 thr = float((rule_json or {}).get("threshold_unit_area_m2", 90))
                 rate_below = float((rule_json or {}).get("rate_below", 1.0))
@@ -671,6 +704,7 @@ def compute_urbanism(
 
     calc["vagas_min"] = vagas
     calc["vagas_texto"] = vagas_texto
+    calc["parking_notes"] = parking_notes
     return calc
 
 
@@ -703,120 +737,114 @@ if "calc" not in st.session_state:
 if "attach_one_side" not in st.session_state:
     st.session_state["attach_one_side"] = False
 
-
-# =============================
-# Catálogo de usos (Categoria + Busca)
-# =============================
-def fallback_use_catalog():
-    # fallback (caso use_types ainda não esteja completo)
-    return {
-        "Residencial": [
-            ("Residencial Unifamiliar (Casa)", "RES_UNI"),
-            ("Residencial Multifamiliar (Prédio)", "RES_MULTI"),
-        ],
-        "Comercial": [
-            ("Comércio Varejista / Loja", "COM_VAREJO"),
-            ("Comércio Atacadista / Depósitos", "COM_ATACADO"),
-            ("Shopping Centers", "SHOPPING"),
-        ],
-        "Serviço": [
-            ("Prestação de Serviços em Geral", "SERV_GERAL"),
-            ("Serviços Bancários e Financeiros", "SERV_BANCO"),
-            ("Serviços de Alimentação", "SERV_ALIMENT"),
-            ("Serviços de Utilidade Pública", "SERV_UTIL"),
-            ("Serviços Automotivos", "SERV_AUTO"),
-            ("Hospedagem", "HOSPEDAGEM"),
-        ],
-        "Saúde/Educação": [
-            ("Serviços na Área Educacional", "EDU"),
-            ("Unidades de Saúde com Internação", "SAUDE_INT"),
-            ("Unidades de Saúde sem Internação", "SAUDE_SINT"),
-        ],
-        "Industrial/Outros": [
-            ("Indústrias", "INDUSTRIA"),
-            ("Templos Religiosos", "TEMPLO"),
-            ("Estádios / Ginásios / Teatros", "ESTADIO"),
-        ]
-    }
-
-
-def build_use_catalog_from_db(use_types_rows: list[dict]) -> Dict[str, list[tuple[str, str]]]:
-    # Espera que use_types tenha category preenchido.
-    catalog: Dict[str, list[tuple[str, str]]] = {}
-    for r in use_types_rows or []:
-        code = r.get("code")
-        label = r.get("label")
-        cat = r.get("category") or "Outros"
-        if not code or not label:
-            continue
-        catalog.setdefault(cat, []).append((label, code))
-
-    # ordena labels dentro da categoria
-    for cat in list(catalog.keys()):
-        catalog[cat] = sorted(catalog[cat], key=lambda x: x[0].lower())
-
-    # se vier vazio, fallback
-    if not catalog:
-        return fallback_use_catalog()
-
-    return catalog
-
-
-use_types_rows = sb_list_use_types()
-use_catalog = build_use_catalog_from_db(use_types_rows)
-
-# lista "global" para Busca Direta
-ALL_USES: list[tuple[str, str, str]] = []
-for cat, items in use_catalog.items():
-    for (label, code) in items:
-        ALL_USES.append((label, code, cat))
-ALL_USES = sorted(ALL_USES, key=lambda x: (x[2].lower(), x[0].lower()))
+# ✅ estado do “filtro de uso” (categoria/busca)
+if "use_category" not in st.session_state:
+    st.session_state["use_category"] = "Residencial"
+if "use_label" not in st.session_state:
+    st.session_state["use_label"] = None
+if "use_code" not in st.session_state:
+    st.session_state["use_code"] = None
+if "use_search_label" not in st.session_state:
+    st.session_state["use_search_label"] = None
+if "use_search_enabled" not in st.session_state:
+    st.session_state["use_search_enabled"] = False
 
 
 # =============================
-# Sidebar (igual às imagens)
+# Sidebar - UX “Categoria + Busca Direta” (igual às imagens)
 # =============================
+use_types = sb_list_use_types()
+
+# fallback caso o banco ainda esteja incompleto
+if not use_types:
+    use_types = [
+        {"code": "RES_UNI", "label": "Residencial Unifamiliar (Casa)", "category": "Residencial", "is_active": True},
+        {"code": "RES_MULTI", "label": "Residencial Multifamiliar (Prédio)", "category": "Residencial", "is_active": True},
+    ]
+
+# normaliza categorias “profissionais”
+def normalize_category(cat: str) -> str:
+    cat = (cat or "").strip()
+    if not cat:
+        return "Sistema"
+    low = cat.lower()
+    if "res" in low:
+        return "Residencial"
+    if "com" in low:
+        return "Comercial"
+    if "serv" in low:
+        return "Serviço"
+    if "saúde" in low or "saude" in low or "educ" in low:
+        return "Saúde/Educação"
+    return cat
+
+for u in use_types:
+    u["category"] = normalize_category(u.get("category"))
+
+# categorias fixas + quaisquer outras do banco
+cat_base = ["Residencial", "Comercial", "Serviço", "Saúde/Educação", "Sistema"]
+cats_in_db = sorted({u.get("category") for u in use_types if u.get("category")})
+categories = []
+for c in cat_base:
+    if c in cats_in_db and c not in categories:
+        categories.append(c)
+for c in cats_in_db:
+    if c not in categories:
+        categories.append(c)
+
+# opções por categoria
+def options_for_category(category: str) -> Dict[str, str]:
+    opts = {u["label"]: u["code"] for u in use_types if u.get("category") == category}
+    return dict(sorted(opts.items(), key=lambda x: x[0].lower()))
+
+# busca direta (todas)
+all_options = {u["label"]: u["code"] for u in use_types}
+all_labels_sorted = sorted(all_options.keys(), key=lambda x: x.lower())
+
 with st.sidebar:
-    st.markdown("<div class='side-block'>", unsafe_allow_html=True)
-    st.markdown("### 1. Escolha o Uso")
-    categories = list(use_catalog.keys())
-    selected_cat = st.selectbox("Categoria:", categories, index=categories.index("Residencial") if "Residencial" in categories else 0)
+    st.markdown("<div class='side-title'>🧾 1. Escolha o Uso</div>", unsafe_allow_html=True)
 
-    options_in_cat = use_catalog.get(selected_cat, [])
-    if not options_in_cat:
-        st.warning("Sem opções nesta categoria.")
-        st.stop()
+    st.session_state["use_category"] = st.selectbox(
+        "Categoria:",
+        categories,
+        index=categories.index(st.session_state.get("use_category", "Residencial"))
+        if st.session_state.get("use_category", "Residencial") in categories else 0
+    )
 
-    labels_cat = [x[0] for x in options_in_cat]
-    label_in_cat = st.selectbox("Opções na Categoria:", labels_cat, index=0)
-    use_label_cat = label_in_cat
-    use_code_cat = dict(options_in_cat)[label_in_cat]
-    st.markdown("</div>", unsafe_allow_html=True)
+    cat_opts = options_for_category(st.session_state["use_category"])
+    if not cat_opts:
+        cat_opts = {"Genérico (fallback) • Sistema": "RES_UNI"}
 
-    st.markdown("<div class='side-block'>", unsafe_allow_html=True)
-    st.markdown("### 2. Busca Direta")
-    all_labels = [f"{lbl}  •  {cat}" for (lbl, _, cat) in ALL_USES]
-    selected_global = st.selectbox("Ou digite para pesquisar:", all_labels, index=0, help="Você pode digitar para filtrar.")
-    idx = all_labels.index(selected_global)
-    use_label_global, use_code_global, use_cat_global = ALL_USES[idx]
-    st.markdown("</div>", unsafe_allow_html=True)
+    cat_labels = list(cat_opts.keys())
+    default_label = st.session_state.get("use_label")
+    if default_label not in cat_labels:
+        default_label = cat_labels[0]
 
-    # Fonte de verdade do uso: se a pessoa mexer na busca direta, ela escolhe por lá.
-    # Regra simples: se o usuário selecionou algum item, usamos a Busca Direta.
-    # (Como Streamlit sempre tem um "selected", isso vira sempre a busca direta.
-    # Então aqui vamos usar: se categoria == cat do item e label igual, mantém; senão, usa o da categoria.)
-    # Para simplificar: vamos priorizar a categoria/itens, e a Busca Direta serve para "atalho" quando o usuário quiser.
-    # -> Use um checkbox "Usar Busca Direta".
-    use_search_direct = st.checkbox("Usar seleção da Busca Direta", value=False)
+    chosen_cat_label = st.selectbox("Opções na Categoria:", cat_labels, index=cat_labels.index(default_label))
+    chosen_cat_code = cat_opts[chosen_cat_label]
 
-    if use_search_direct:
-        use_label = use_label_global
-        use_code = use_code_global
-        use_cat = use_cat_global
+    st.markdown("<div class='hr-soft'></div>", unsafe_allow_html=True)
+    st.markdown("<div class='side-title'>🔎 2. Busca Direta</div>", unsafe_allow_html=True)
+
+    chosen_search_label = st.selectbox(
+        "Ou digite para pesquisar:",
+        all_labels_sorted,
+        index=all_labels_sorted.index(st.session_state.get("use_search_label")) if st.session_state.get("use_search_label") in all_labels_sorted else 0
+    )
+
+    st.session_state["use_search_enabled"] = st.checkbox("Usar seleção da Busca Direta", value=bool(st.session_state.get("use_search_enabled", False)))
+
+    # resolve o uso final
+    if st.session_state["use_search_enabled"]:
+        st.session_state["use_search_label"] = chosen_search_label
+        st.session_state["use_label"] = chosen_search_label
+        st.session_state["use_code"] = all_options[chosen_search_label]
     else:
-        use_label = use_label_cat
-        use_code = use_code_cat
-        use_cat = selected_cat
+        st.session_state["use_label"] = chosen_cat_label
+        st.session_state["use_code"] = chosen_cat_code
+
+use_label = st.session_state["use_label"]
+use_code = st.session_state["use_code"]
 
 
 # =============================
@@ -866,6 +894,7 @@ with col_map:
             st.session_state["calc"] = None
             st.rerun()
 
+
 with col_panel:
     st.subheader("Selecione o lote no mapa")
 
@@ -880,7 +909,7 @@ with col_panel:
     st.code(f"lat: {lat:.6f}\nlon: {lon:.6f}", language="text")
 
     st.subheader("Dados do lote/projeto")
-    st.write(f"**Uso selecionado:** {use_label}")
+    st.caption(f"Uso selecionado: **{use_label}**")
 
     testada = st.number_input("Testada / Frente (m)", min_value=1.0, value=10.0, step=0.5)
     profundidade = st.number_input("Profundidade / Lateral (m)", min_value=1.0, value=30.0, step=0.5)
@@ -890,7 +919,7 @@ with col_panel:
     if esquina:
         corner_two_fronts = st.checkbox("Considerar 2 frentes (esquina)", value=True)
 
-    # ✅ Multifamiliar (opcional) — APARECE SOMENTE se for RES_MULTI
+    # ✅ Multifamiliar (opcional) — APARECE SÓ se for RES_MULTI
     qtd_unidades = None
     area_unidade_m2 = None
     if use_code == "RES_MULTI":
@@ -900,22 +929,21 @@ with col_panel:
         qtd_unidades = int(qtd_u) if qtd_u and qtd_u > 0 else None
         area_unidade_m2 = float(area_u) if area_u and area_u > 0 else None
 
-    # Encostar (desabilitado para RES_MULTI por enquanto)
+    # ✅ Encostar em 1 lateral:
+    # - Mantemos “profissional”: por padrão, NÃO habilita no multifamiliar.
     last_calc = st.session_state.get("calc") or {}
     last_rule = (last_calc.get("rule") or {}) if isinstance(last_calc, dict) else {}
     allow_attach_last = bool(last_rule.get("allow_attach_one_side") or False)
 
-    disable_attach = (use_code == "RES_MULTI") or (not allow_attach_last)
-
-    help_attach = "Só habilita depois que você calcular uma zona que permita encostar em 1 lateral."
-    if use_code == "RES_MULTI":
-        help_attach = "Por segurança, está desabilitado para Multifamiliar. Se a lei permitir, a gente reativa."
-
+    disable_attach = (use_code == "RES_MULTI")  # padrão seguro para multifamiliar
     st.session_state["attach_one_side"] = st.checkbox(
         "Encostar em 1 lateral (zerar recuo)",
-        value=bool(st.session_state.get("attach_one_side", False)),
-        disabled=disable_attach,
-        help=help_attach
+        value=False if disable_attach else bool(st.session_state.get("attach_one_side", False)),
+        disabled=disable_attach or (not allow_attach_last),
+        help=(
+            "Por padrão, essa opção fica desativada no multifamiliar. "
+            "Se você quiser liberar no futuro, a gente controla por regra no banco."
+        ),
     )
 
     st.subheader("Calcular")
@@ -926,15 +954,16 @@ with col_panel:
             st.session_state["res"] = res
 
             zona_sigla = res.get("zona_sigla") or ""
-            rule = sb_get_zone_rule(zona_sigla, use_code)
+
+            # ✅ regra com fallback (RES_MULTI -> RES_UNI)
+            rule, used_fallback = sb_get_zone_rule_with_fallback(zona_sigla, use_code)
+
             park = sb_get_parking_rule(use_code)
 
             allow_attach_now = bool((rule or {}).get("allow_attach_one_side") or False)
-            attach_one_side = bool(st.session_state.get("attach_one_side", False)) and allow_attach_now
-
-            # trava para RES_MULTI (por enquanto)
-            if use_code == "RES_MULTI":
-                attach_one_side = False
+            attach_one_side = False
+            if (not disable_attach) and bool(st.session_state.get("attach_one_side", False)) and allow_attach_now:
+                attach_one_side = True
 
             calc = compute_urbanism(
                 zone_sigla=zona_sigla,
@@ -950,11 +979,12 @@ with col_panel:
                 qtd_unidades=qtd_unidades,
                 area_unidade_m2=area_unidade_m2,
             )
+            calc["used_rule_fallback"] = bool(used_fallback)
             st.session_state["calc"] = calc
 
         st.rerun()
 
-    st.caption("💡 Dica: o pin aparece na hora. O cálculo acontece só quando você clicar em **Gerar Estudo**.")
+    st.caption("💡 Dica: o pin aparece na hora. O cálculo acontece só quando você clicar em **Gerar estudo**.")
 
 
 # =============================
@@ -967,7 +997,7 @@ st.divider()
 st.markdown("## Resultados")
 
 if not res or not calc:
-    st.caption("Clique no mapa, preencha os dados e clique em **Gerar Estudo** para ver os resultados.")
+    st.caption("Clique no mapa, preencha os dados e depois clique em **Gerar estudo** para ver os resultados.")
     st.stop()
 
 c1, c2, c3 = st.columns(3)
@@ -978,7 +1008,7 @@ with c1:
         <div class="card">
           <div class="pill">📍 Localização</div>
           <div class="muted">Coordenadas</div>
-          <div class="big">{lat:.6f}, {lon:.6f}</div>
+          <div class="big">{float(st.session_state["click"]["lat"]):.6f}, {float(st.session_state["click"]["lng"]):.6f}</div>
           <div class="muted" style="margin-top:10px;">Zona</div>
           <div class="big">{res.get("zona_nome") or "—"}</div>
           <div class="muted" style="margin-top:10px;">Sigla</div>
@@ -1114,7 +1144,7 @@ if rule.get("requires_subzone"):
         "<div class='warn'><b>⚠ Zona com subzona/setor</b><br/>"
         "Essa zona tem parâmetros por <b>setor/subzona</b>. "
         "Por enquanto você está usando uma regra <b>genérica</b>. "
-        "Quando quiser, a gente adiciona seleção de setor no app (ZEIS 1/2/3, ZPP 1/2/3, ZEIA 1/2/3/APP, ZEIP 1..9, ZEPE 1/2).</div>",
+        "Quando quiser, a gente adiciona seleção de setor no app.</div>",
         unsafe_allow_html=True,
     )
 
@@ -1204,7 +1234,7 @@ st.markdown(
 
 
 # =============================
-# Vagas mínimas
+# Vagas mínimas (calculado OU texto da regra + observações)
 # =============================
 st.divider()
 st.markdown("## Vagas mínimas")
@@ -1237,20 +1267,19 @@ elif calc.get("vagas_texto"):
 else:
     st.caption("Sem regra de estacionamento cadastrada para este uso.")
 
-# Observações gerais (Anexo IV)
-st.markdown(
-    """
-    <div class="warn">
-      <b>Observações importantes (estacionamento – Anexo IV)</b><br/>
-      • <b>Arredondamento:</b> quando o resultado tiver fração com décimo ≥ 0,5, arredonda para o número inteiro superior.<br/>
-      • <b>Motos:</b> até <b>30%</b> das vagas previstas podem ser destinadas a motocicletas.<br/>
-      • <b>VLT:</b> pode haver redução de até <b>20%</b> das vagas (uso não residencial) se estiver em raio de 250m de estação de VLT (quando aplicável).<br/>
-      • <b>Via local (não residencial):</b> até 100m² de área útil pode ser dispensado de vagas (quando aplicável).<br/>
-      • <b>Tombamento:</b> pode haver dispensa se houver impossibilidade comprovada (quando aplicável).<br/>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+parking_notes = calc.get("parking_notes") or []
+if parking_notes:
+    st.markdown(
+        "<div class='warn'><b>Observações importantes</b><br/>"
+        + "<br/>".join([f"• {n}" for n in parking_notes])
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+# fonte da regra de vagas
+park = calc.get("park") or {}
+if park.get("source_ref"):
+    st.caption(f"Fonte (vagas): {park.get('source_ref')}")
 
 with st.expander("Debug (raw)"):
     st.write("location:")
