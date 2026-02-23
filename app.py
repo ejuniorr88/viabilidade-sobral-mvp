@@ -1,5 +1,6 @@
 import os
 import json
+import math
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 from numbers import Integral
@@ -451,9 +452,10 @@ def sb_get_zone_rule(zone_sigla: str, use_type_code: str) -> Optional[Dict[str, 
 def sb_get_parking_rule(use_type_code: str) -> Optional[Dict[str, Any]]:
     if not use_type_code:
         return None
+    # ✅ inclui rule_json para as regras "json_rule" (multifamiliar)
     res = (
         sb.table("parking_rules")
-        .select("use_type_code,metric,value,min_vagas,source_ref")
+        .select("use_type_code,metric,value,min_vagas,source_ref,rule_json")
         .eq("use_type_code", use_type_code)
         .limit(1)
         .execute()
@@ -492,6 +494,9 @@ def compute_urbanism(
     attach_one_side: bool,
     rule: Optional[Dict[str, Any]],
     park: Optional[Dict[str, Any]],
+    # ✅ novos (opcionais, principalmente pra RES_MULTI)
+    qtd_unidades: Optional[int] = None,
+    area_unidade_m2: Optional[float] = None,
 ) -> Dict[str, Any]:
     area_lote = float(testada) * float(profundidade)
 
@@ -507,6 +512,8 @@ def compute_urbanism(
         "area_lote": area_lote,
         "rule": rule,
         "park": park,
+        "qtd_unidades": qtd_unidades,
+        "area_unidade_m2": area_unidade_m2,
     }
 
     if rule:
@@ -588,23 +595,31 @@ def compute_urbanism(
 
         calc["pavimentos_estimados"] = estimate_pavimentos(g_pav, g_m)
 
-    # vagas (MVP)
+    # =============================
+    # ✅ Vagas (agora com json_rule + modo opcional)
+    # =============================
     vagas = None
+    vagas_texto = None
+
     if park:
         metric = park.get("metric")
         value = park.get("value") or 0
         min_v = park.get("min_vagas")
+        rule_json = park.get("rule_json") or {}
+
         if metric == "fixed":
             try:
                 vagas = int(value)
             except Exception:
                 vagas = None
+
         elif metric == "per_unit":
-            if use_code == "RES_UNI":
-                try:
-                    vagas = max(int(value), int(min_v or 0))
-                except Exception:
-                    vagas = None
+            # exemplo: RES_UNI (fixo por unidade)
+            try:
+                vagas = max(int(value), int(min_v or 0))
+            except Exception:
+                vagas = None
+
         elif metric == "per_area":
             try:
                 vagas = int((area_lote * float(value)) // 1)
@@ -613,7 +628,39 @@ def compute_urbanism(
             except Exception:
                 vagas = None
 
+        elif metric == "json_rule":
+            rtype = (rule_json or {}).get("type")
+
+            # RES_MULTI: por área da unidade (com texto sempre, cálculo opcional)
+            if rtype == "per_unit_by_unit_area":
+                vagas_texto = (rule_json or {}).get("display_text")
+
+                thr = float((rule_json or {}).get("threshold_unit_area_m2", 90))
+                rate_below = float((rule_json or {}).get("rate_below", 1.0))
+                rate_at_or_above = float((rule_json or {}).get("rate_at_or_above", 1.5))
+                rounding = (rule_json or {}).get("rounding", "ceil")
+
+                if qtd_unidades and area_unidade_m2:
+                    try:
+                        qtd_unidades_i = int(qtd_unidades)
+                        area_u = float(area_unidade_m2)
+
+                        rate = rate_below if area_u < thr else rate_at_or_above
+                        raw = qtd_unidades_i * rate
+
+                        if rounding == "ceil":
+                            vagas = int(math.ceil(raw))
+                        else:
+                            vagas = int(round(raw))
+
+                        if min_v is not None:
+                            vagas = max(vagas, int(min_v))
+
+                    except Exception:
+                        vagas = None
+
     calc["vagas_min"] = vagas
+    calc["vagas_texto"] = vagas_texto
     return calc
 
 
@@ -729,6 +776,16 @@ with col_panel:
     if esquina:
         corner_two_fronts = st.checkbox("Considerar 2 frentes (esquina)", value=True)
 
+    # ✅ Multifamiliar (opcional) — para calcular vagas quando o usuário souber
+    qtd_unidades = None
+    area_unidade_m2 = None
+    if use_code == "RES_MULTI":
+        st.subheader("Dados do multifamiliar (opcional)")
+        qtd_u = st.number_input("Quantidade de apartamentos (opcional)", min_value=0, value=0, step=1)
+        area_u = st.number_input("Área média do apartamento (m²) (opcional)", min_value=0.0, value=0.0, step=5.0)
+        qtd_unidades = int(qtd_u) if qtd_u and qtd_u > 0 else None
+        area_unidade_m2 = float(area_u) if area_u and area_u > 0 else None
+
     # Encostar (só faz sentido se a regra permitir; após calcular a gente habilita)
     last_calc = st.session_state.get("calc") or {}
     last_rule = (last_calc.get("rule") or {}) if isinstance(last_calc, dict) else {}
@@ -766,6 +823,8 @@ with col_panel:
                 attach_one_side=bool(attach_one_side),
                 rule=rule,
                 park=park,
+                qtd_unidades=qtd_unidades,
+                area_unidade_m2=area_unidade_m2,
             )
             st.session_state["calc"] = calc
 
@@ -1019,19 +1078,39 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# =============================
+# ✅ Vagas mínimas (calculado OU texto da regra)
+# =============================
+st.divider()
+st.markdown("## Vagas mínimas")
+
 if calc.get("vagas_min") is not None:
-    st.divider()
-    st.markdown("## Vagas mínimas")
     st.markdown(
         f"""
         <div class="card">
           <h4>🚗 Estacionamento</h4>
-          <div class="big">Vagas mínimas: {int(calc.get("vagas_min"))}</div>
-          <div class="muted">Regra puxada do Supabase (tabela parking_rules).</div>
+          <div class="big">Vagas mínimas estimadas: {int(calc.get("vagas_min"))}</div>
+          <div class="muted">Cálculo feito com base nos dados informados.</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+elif calc.get("vagas_texto"):
+    st.markdown(
+        f"""
+        <div class="card">
+          <h4>🚗 Estacionamento</h4>
+          <div class="big">Regra:</div>
+          <div class="muted">{calc.get("vagas_texto")}</div>
+          <div class="muted" style="margin-top:8px;">
+            Para calcular automaticamente, informe <b>quantidade de apartamentos</b> e <b>área média</b>.
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+else:
+    st.caption("Sem regra de estacionamento cadastrada para este uso.")
 
 with st.expander("Debug (raw)"):
     st.write("location:")
