@@ -1,6 +1,7 @@
 import os
 import json
 import math
+import re
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 from numbers import Integral
@@ -249,6 +250,229 @@ def envelope_area(
 
 
 # =============================
+# NEW: Sanitários (Anexo III) + Estacionamento v2 (Anexo IV)
+# =============================
+def _parse_formula_divisor(formula: str) -> Optional[float]:
+    # "1/300,00m² ou fração" -> 300.0
+    if not formula:
+        return None
+    m = re.search(r"1\s*/\s*([\d\.,]+)\s*m", formula)
+    if not m:
+        return None
+    raw = m.group(1).replace(".", "").replace(",", ".")
+    try:
+        return float(raw)
+    except Exception:
+        return None
+
+
+def _ceil_div(a: float, b: float) -> int:
+    return int(math.ceil(a / b)) if b and a is not None else 0
+
+
+def calc_sanitary(profile_json: dict, area_util_m2: float) -> Dict[str, Any]:
+    area = float(area_util_m2 or 0)
+    out = {"area_util_m2": area, "groups": {}, "totals": {}}
+    totals: Dict[str, int] = {}
+
+    keys = ["lavatórios", "aparelhos_sanitários", "chuveiros", "mictórios"]
+
+    for grp in (profile_json.get("groups") or []):
+        gname = grp.get("group") or "GERAL"
+        chosen = None
+
+        for b in (grp.get("bands") or []):
+            mn = float(b.get("min_m2", 0))
+            mx = b.get("max_m2", None)
+            if area >= mn and (mx is None or area <= float(mx)):
+                chosen = b
+                break
+
+        if not chosen:
+            continue
+
+        gvals: Dict[str, Any] = {}
+        for k in keys:
+            v = chosen.get(k, None)
+            f = chosen.get(f"{k}_formula", None)
+
+            if v is not None:
+                gvals[k] = int(v) if isinstance(v, (int, float)) else None
+            elif f:
+                div = _parse_formula_divisor(f)
+                gvals[k] = _ceil_div(area, div) if div else None
+            else:
+                gvals[k] = None
+
+        if chosen.get("note"):
+            gvals["_note"] = chosen["note"]
+
+        out["groups"][gname] = gvals
+
+        for k in keys:
+            val = gvals.get(k)
+            if isinstance(val, int):
+                totals[k] = totals.get(k, 0) + val
+
+    out["totals"] = totals
+    return out
+
+
+def round_rule_annex_iv(x: float) -> int:
+    """
+    Regra do Anexo IV:
+    se o resultado for uma fração cujo décimo >= 5, arredonda pro inteiro superior.
+    """
+    if x <= 0:
+        return 0
+    v10 = round(x, 1)
+    i = int(math.floor(v10))
+    frac = v10 - i
+    if frac >= 0.5:
+        return i + 1
+    return max(i, 0)
+
+
+def safe_eval_condition(cond: str, ctx: Dict[str, Any]) -> bool:
+    if not cond:
+        return True
+    allowed = {"__builtins__": {}}
+    return bool(eval(cond, allowed, ctx))
+
+
+def calc_parking_v2(rule_json: dict, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    rule_json deve vir do Supabase (parking_rules_v2.rule_json),
+    seguindo o padrão do Anexo IV que você montou.
+    """
+    base_metric = rule_json.get("base_metric")
+    rules = rule_json.get("rules") or []
+
+    out = {
+        "use_code": rule_json.get("use_code"),
+        "base_metric": base_metric,
+        "inputs": inputs,
+        "raw": None,
+        "required": None,
+        "applied_rule_text": None,
+        "adjustments": [],
+        "cargo_loading_text": (rule_json.get("cargo_loading") or {}).get("text"),
+        "notes": [],
+        "general_notes": rule_json.get("general_notes") or [],
+    }
+
+    area = float(inputs.get("area_util_m2") or 0)
+
+    # Dispensa: não residencial até 100m² em via local (quando base = área útil)
+    if inputs.get("is_via_local") and base_metric == "area_util_m2":
+        if 0 < area <= 100 and (rule_json.get("use_code") or "").upper() not in ("RESIDENCIAS_MULTIFAMILIARES", "RES_MULTI"):
+            out["raw"] = 0.0
+            out["required"] = 0
+            out["applied_rule_text"] = "Dispensa: não residencial ≤ 100m² em via local."
+            return out
+
+    raw = None
+    applied_text = None
+
+    for r in rules:
+        rtype = r.get("type")
+
+        if rtype == "fixed":
+            try:
+                raw = float(r.get("value", 0))
+                applied_text = r.get("text")
+                break
+            except Exception:
+                continue
+
+        if rtype == "ratio":
+            if base_metric == "area_util_m2":
+                per = float(r.get("per_m2"))
+                raw = area / per if per else 0.0
+                applied_text = r.get("text")
+                break
+            else:
+                per_units = float(r.get("per_units"))
+                qty = float(inputs.get(base_metric) or 0)
+                raw = qty / per_units if per_units else 0.0
+                applied_text = r.get("text")
+                break
+
+        elif rtype == "band_ratio":
+            if base_metric != "area_util_m2":
+                continue
+            for b in (r.get("bands") or []):
+                mn = float(b.get("min_m2", 0))
+                mx = b.get("max_m2", None)
+                if area >= mn and (mx is None or area <= float(mx)):
+                    per = float(b.get("per_m2"))
+                    raw = area / per if per else 0.0
+                    applied_text = b.get("text")
+                    break
+            if raw is not None:
+                break
+
+        elif rtype in ("threshold_fixed", "fixed_or_band"):
+            # threshold_fixed (v2)
+            if base_metric != "area_util_m2":
+                continue
+            mx = r.get("max_m2", None)
+            if mx is None:
+                # fixed_or_band textual: não dá pra calcular
+                out["notes"].append("Regra textual (fixed_or_band) - precisa padronizar em JSON calculável.")
+                continue
+            mx = float(mx)
+            if area <= mx:
+                raw = float(r.get("count", 0))
+                applied_text = r.get("text")
+                break
+
+        elif rtype == "ratio_above_threshold":
+            if base_metric != "area_util_m2":
+                continue
+            mn = float(r.get("min_m2"))
+            if area >= mn:
+                per = float(r.get("per_m2"))
+                raw = area / per if per else 0.0
+                applied_text = r.get("text")
+                break
+
+        elif rtype in ("per_unit", "per_unit_with_condition"):
+            qty = float(inputs.get("apartamentos") or 0)
+            val = float(r.get("value", r.get("per_unit", 0)))
+            cond = r.get("condition")
+            ctx = dict(inputs)
+            if cond:
+                if safe_eval_condition(cond, ctx):
+                    raw = qty * val
+                    applied_text = r.get("text")
+                    break
+            else:
+                raw = qty * val
+                applied_text = r.get("text")
+                break
+
+    out["raw"] = raw
+    out["applied_rule_text"] = applied_text
+
+    if raw is None:
+        out["required"] = None
+        out["notes"].append("Sem dados suficientes para calcular automaticamente.")
+        return out
+
+    req = round_rule_annex_iv(float(raw))
+
+    # redução VLT 20% (se marcado)
+    if inputs.get("near_vlt") and req and req > 0:
+        reduced = int(math.ceil(req * 0.8))
+        out["adjustments"].append({"type": "VLT_20pct", "from": req, "to": reduced})
+        req = reduced
+
+    out["required"] = req
+    return out
+
+
+# =============================
 # GeoJSON load / indexes
 # =============================
 @st.cache_data(show_spinner=False)
@@ -437,6 +661,7 @@ def sb_get_zone_rule(zone_sigla: str, use_type_code: str) -> Optional[Dict[str, 
     return data[0] if data else None
 
 
+# --- antigo (fallback) ---
 @st.cache_data(show_spinner=False, ttl=300)
 def sb_get_parking_rule(use_type_code: str) -> Optional[Dict[str, Any]]:
     if not use_type_code:
@@ -452,8 +677,55 @@ def sb_get_parking_rule(use_type_code: str) -> Optional[Dict[str, Any]]:
     return data[0] if data else None
 
 
+# --- novo (Anexo IV) ---
+@st.cache_data(show_spinner=False, ttl=300)
+def sb_get_parking_rule_v2(use_code: str) -> Optional[Dict[str, Any]]:
+    if not use_code:
+        return None
+    res = (
+        sb.table("parking_rules_v2")
+        .select("use_code,base_metric,rule_json,general_notes,source_ref,notes")
+        .eq("use_code", use_code)
+        .limit(1)
+        .execute()
+    )
+    data = res.data or []
+    return data[0] if data else None
+
+
+# --- Sanitários (Anexo III) ---
+@st.cache_data(show_spinner=False, ttl=300)
+def sb_get_use_sanitary_profile(use_code: str) -> Optional[Dict[str, Any]]:
+    if not use_code:
+        return None
+    res = (
+        sb.table("use_sanitary_profile")
+        .select("use_type_code,sanitary_profile,notes")
+        .eq("use_type_code", use_code)
+        .limit(1)
+        .execute()
+    )
+    data = res.data or []
+    return data[0] if data else None
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def sb_get_sanitary_profile(profile_code: str) -> Optional[Dict[str, Any]]:
+    if not profile_code:
+        return None
+    res = (
+        sb.table("sanitary_profiles")
+        .select("sanitary_profile,title,rule_json,source_ref,notes")
+        .eq("sanitary_profile", profile_code)
+        .limit(1)
+        .execute()
+    )
+    data = res.data or []
+    return data[0] if data else None
+
+
 # =============================
-# Cálculos urbanísticos
+# Cálculos urbanísticos (seu motor atual)
 # =============================
 def estimate_pavimentos(gabarito_pav: Optional[int], gabarito_m: Optional[float]) -> Optional[int]:
     try:
@@ -582,7 +854,7 @@ def compute_urbanism(
         calc["pavimentos_estimados"] = estimate_pavimentos(g_pav, g_m)
 
     # =============================
-    # Vagas: suporta json_rule (RES_MULTI)
+    # Vagas (fallback antigo)
     # =============================
     vagas = None
     vagas_texto = None
@@ -698,7 +970,6 @@ if not use_types:
         {"code": "RES_MULTI", "label": "Residencial Multifamiliar (Prédio)", "category": "Residencial"},
     ]
 
-# categorias ordenadas
 preferred_order = ["Residencial", "Comercial", "Serviço", "Saúde/Educação", "Institucional", "Industrial", "Misto", "Sistema"]
 cats = sorted({(u.get("category") or "Sistema") for u in use_types}, key=lambda c: (preferred_order.index(c) if c in preferred_order else 999, c))
 
@@ -716,7 +987,6 @@ use_code_cat = cat_options[use_label_cat]
 
 st.sidebar.markdown("<div class='sidebar-section' style='margin-top:10px;'><b>🔎 2. Busca Direta</b></div>", unsafe_allow_html=True)
 
-# itens da busca global (com prefixo da categoria)
 search_items = []
 search_map = {}
 for u in use_types:
@@ -731,7 +1001,6 @@ search_items = sorted(search_items, key=lambda x: x.lower())
 search_pick = st.sidebar.selectbox("Ou digite para pesquisar:", ["—"] + search_items)
 use_search = st.sidebar.checkbox("Usar seleção da Busca Direta", value=False)
 
-# Escolha final do uso (categoria vs busca)
 if use_search and search_pick != "—":
     use_label, use_code = search_map[search_pick]
     use_category = search_pick.split(":")[0]
@@ -804,11 +1073,11 @@ with col_panel:
     if esquina:
         corner_two_fronts = st.checkbox("Considerar 2 frentes (esquina)", value=True)
 
-    # Multifamiliar (opcional)
+    # Multifamiliar (opcional do motor antigo)
     qtd_unidades = None
     area_unidade_m2 = None
     if use_code == "RES_MULTI":
-        st.subheader("Dados do multifamiliar (opcional)")
+        st.subheader("Dados do multifamiliar (opcional • motor antigo)")
         qtd_u = st.number_input("Quantidade de apartamentos (opcional)", min_value=0, value=0, step=1)
         area_u = st.number_input("Área média do apartamento (m²) (opcional)", min_value=0.0, value=0.0, step=5.0)
         qtd_unidades = int(qtd_u) if qtd_u and qtd_u > 0 else None
@@ -828,6 +1097,39 @@ with col_panel:
         help="Só habilita se a regra da zona permitir. Multifamiliar fica desabilitado por padrão (mais seguro)."
     )
 
+    # =============================
+    # Inputs complementares (Anexos III e IV - v2)
+    # =============================
+    park_v2_preview = sb_get_parking_rule_v2(use_code)
+    base_metric = (park_v2_preview or {}).get("base_metric")
+
+    st.subheader("Dados complementares (Anexos III e IV)")
+
+    near_vlt = st.checkbox("Está a até 250m de estação VLT? (pode reduzir vagas em até 20%)", value=False)
+    is_via_local = st.checkbox("O imóvel está em via local? (dispensa não residencial ≤ 100m² área útil)", value=False)
+
+    area_util_m2 = 0.0
+    lugares = 0
+    leitos = 0
+    unidades_hospedagem = 0
+    apartamentos = 0
+    apto_area_m2 = 0.0
+
+    if base_metric in (None, "", "area_util_m2"):
+        area_util_m2 = st.number_input("Área útil (m²) (para vagas e sanitários)", min_value=0.0, value=0.0, step=10.0)
+    elif base_metric == "lugares":
+        lugares = st.number_input("Quantidade de lugares", min_value=0, value=0, step=1)
+    elif base_metric == "leitos":
+        leitos = st.number_input("Quantidade de leitos", min_value=0, value=0, step=1)
+    elif base_metric == "unidades_hospedagem":
+        unidades_hospedagem = st.number_input("Unidades de hospedagem (UH)", min_value=0, value=0, step=1)
+    elif base_metric in ("apartamentos",):
+        apartamentos = st.number_input("Quantidade de apartamentos", min_value=0, value=0, step=1)
+        apto_area_m2 = st.number_input("Área construída média do apartamento (m²)", min_value=0.0, value=0.0, step=5.0)
+    else:
+        # fallback: sempre oferece área útil
+        area_util_m2 = st.number_input("Área útil (m²) (fallback)", min_value=0.0, value=0.0, step=10.0)
+
     st.subheader("Calcular")
 
     if st.button("🚀 GERAR ESTUDO DE VIABILIDADE", use_container_width=True):
@@ -837,7 +1139,14 @@ with col_panel:
 
             zona_sigla = res.get("zona_sigla") or ""
             rule = sb_get_zone_rule(zona_sigla, use_code)
-            park = sb_get_parking_rule(use_code)
+
+            # estacionamento: v2 + fallback antigo
+            park_v2 = sb_get_parking_rule_v2(use_code)
+            park_old = sb_get_parking_rule(use_code)
+
+            # sanitários
+            use_prof = sb_get_use_sanitary_profile(use_code)
+            san_prof = sb_get_sanitary_profile((use_prof or {}).get("sanitary_profile"))
 
             allow_attach_now = bool((rule or {}).get("allow_attach_one_side") or False)
             attach_one_side = bool(st.session_state.get("attach_one_side", False)) and allow_attach_now and (use_code != "RES_MULTI")
@@ -852,10 +1161,41 @@ with col_panel:
                 corner_two_fronts=bool(corner_two_fronts),
                 attach_one_side=bool(attach_one_side),
                 rule=rule,
-                park=park,
+                park=park_old,  # fallback antigo
                 qtd_unidades=qtd_unidades,
                 area_unidade_m2=area_unidade_m2,
             )
+
+            parking_inputs = {
+                "near_vlt": bool(near_vlt),
+                "is_via_local": bool(is_via_local),
+                "area_util_m2": float(area_util_m2 or 0),
+                "lugares": int(lugares or 0),
+                "leitos": int(leitos or 0),
+                "unidades_hospedagem": int(unidades_hospedagem or 0),
+                "apartamentos": int(apartamentos or 0),
+                "apto_area_m2": float(apto_area_m2 or 0),
+            }
+
+            if park_v2 and (park_v2.get("rule_json") or {}).get("use_code"):
+                pv2 = calc_parking_v2(park_v2["rule_json"], parking_inputs)
+                calc["parking_v2"] = pv2
+                calc["parking_v2_source_ref"] = park_v2.get("source_ref")
+            else:
+                calc["parking_v2"] = None
+                calc["parking_v2_source_ref"] = None
+
+            if san_prof and san_prof.get("rule_json") and float(area_util_m2 or 0) > 0:
+                sres = calc_sanitary(san_prof["rule_json"], float(area_util_m2))
+                calc["sanitary"] = {
+                    "profile": san_prof.get("sanitary_profile"),
+                    "title": san_prof.get("title"),
+                    "source_ref": san_prof.get("source_ref"),
+                    "result": sres,
+                }
+            else:
+                calc["sanitary"] = None
+
             st.session_state["calc"] = calc
 
         st.rerun()
@@ -1020,26 +1360,53 @@ if rule.get("observacoes"):
 if rule.get("source_ref"):
     st.caption(f"Fonte: {rule.get('source_ref')}")
 
+# =============================
+# Vagas mínimas (prioriza Anexo IV v2)
+# =============================
 st.divider()
 st.markdown("## Vagas mínimas")
 
-if calc.get("vagas_min") is not None:
-    extra = ""
-    if calc.get("vagas_moto_txt"):
-        extra = f"<div class='muted' style='margin-top:8px;'>{calc.get('vagas_moto_txt')}</div>"
+pv2 = calc.get("parking_v2")
+
+if pv2 and pv2.get("required") is not None:
+    adj = pv2.get("adjustments") or []
+    adj_txt = ""
+    if adj:
+        a = adj[0]
+        adj_txt = f"<div class='muted' style='margin-top:8px;'>Ajuste aplicado: {a.get('type')} • {a.get('from')} → {a.get('to')}</div>"
+
+    cargo_txt = pv2.get("cargo_loading_text")
+    cargo_html = f"<div class='muted' style='margin-top:8px;'>Carga/Descarga: {cargo_txt}</div>" if cargo_txt else ""
 
     st.markdown(
         f"""
         <div class="card">
-          <h4>🚗 Estacionamento</h4>
-          <div class="big">Vagas mínimas estimadas: {int(calc.get("vagas_min"))}</div>
-          <div class="muted">Cálculo feito com base nos dados informados.</div>
-          {extra}
+          <h4>🚗 Estacionamento (Anexo IV)</h4>
+          <div class="big">Vagas mínimas: {int(pv2.get("required"))}</div>
+          <div class="muted">{pv2.get("applied_rule_text") or ""}</div>
+          {adj_txt}
+          {cargo_html}
         </div>
         """,
         unsafe_allow_html=True,
     )
-elif calc.get("vagas_texto"):
+    if calc.get("parking_v2_source_ref"):
+        st.caption(f"Fonte: {calc.get('parking_v2_source_ref')}")
+
+elif pv2 and pv2.get("required") is None:
+    st.markdown(
+        f"""
+        <div class="card">
+          <h4>🚗 Estacionamento (Anexo IV)</h4>
+          <div class="big">Não foi possível calcular automaticamente</div>
+          <div class="muted">{pv2.get("applied_rule_text") or ""}</div>
+          <div class="muted">{(" • ".join(pv2.get("notes") or []))}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+elif calc.get("vagas_min") is not None:
     extra = ""
     if calc.get("vagas_moto_txt"):
         extra = f"<div class='muted' style='margin-top:8px;'>{calc.get('vagas_moto_txt')}</div>"
@@ -1047,13 +1414,10 @@ elif calc.get("vagas_texto"):
     st.markdown(
         f"""
         <div class="card">
-          <h4>🚗 Estacionamento</h4>
-          <div class="big">Regra:</div>
-          <div class="muted">{calc.get("vagas_texto")}</div>
+          <h4>🚗 Estacionamento (fallback antigo)</h4>
+          <div class="big">Vagas mínimas estimadas: {int(calc.get("vagas_min"))}</div>
+          <div class="muted">Cálculo feito com base no cadastro antigo.</div>
           {extra}
-          <div class="muted" style="margin-top:8px;">
-            Para calcular automaticamente, informe <b>quantidade de apartamentos</b> e <b>área média</b> (apenas no multifamiliar).
-          </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1061,10 +1425,56 @@ elif calc.get("vagas_texto"):
 else:
     st.caption("Sem regra de estacionamento cadastrada para este uso.")
 
+# =============================
+# Sanitários mínimos (Anexo III)
+# =============================
+st.divider()
+st.markdown("## Sanitários mínimos (Anexo III)")
+
+san = calc.get("sanitary")
+
+if san and san.get("result"):
+    sres = san["result"]
+    totals = sres.get("totals") or {}
+    title = san.get("title") or "Perfil sanitário"
+
+    st.markdown(
+        f"""
+        <div class="card">
+          <h4>🚻 {title}</h4>
+          <div class="muted">Área útil considerada: {fmt_m2(sres.get("area_util_m2"))}</div>
+          <div class="big" style="margin-top:10px;">
+            Totais: Lavatórios {totals.get("lavatórios","—")} •
+            Aparelhos {totals.get("aparelhos_sanitários","—")} •
+            Mictórios {totals.get("mictórios","—")} •
+            Chuveiros {totals.get("chuveiros","—")}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("Detalhamento por grupo"):
+        for gname, vals in (sres.get("groups") or {}).items():
+            st.write(f"**{gname}**")
+            st.json(vals)
+
+    if san.get("source_ref"):
+        st.caption(f"Fonte: {san.get('source_ref')}")
+else:
+    st.caption("Sem perfil sanitário vinculado (use_sanitary_profile) OU área útil não informada (> 0).")
+
+# =============================
+# Debug
+# =============================
 with st.expander("Debug (raw)"):
     st.write("location:")
     st.json(res or {})
     st.write("rule:")
     st.json(calc.get("rule") or {})
-    st.write("parking:")
+    st.write("parking_old:")
     st.json(calc.get("park") or {})
+    st.write("parking_v2:")
+    st.json(calc.get("parking_v2") or {})
+    st.write("sanitary:")
+    st.json(calc.get("sanitary") or {})
