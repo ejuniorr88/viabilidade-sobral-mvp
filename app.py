@@ -69,10 +69,31 @@ st.markdown(
         border-radius: 12px;
         margin-top: 10px;
       }
+      .note {
+        background: rgba(108, 117, 125, 0.08);
+        border: 1px solid rgba(108, 117, 125, 0.18);
+        padding: 10px 12px;
+        border-radius: 12px;
+        margin-top: 10px;
+      }
+      .note ul { margin: 6px 0 0 18px; }
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+
+# =============================
+# Observações (Anexo IV – Estacionamento)
+# =============================
+PARKING_NOTES_GENERAL = [
+    "Arredondamento: quando o cálculo gerar fração com decimal ≥ 0,5, arredonda para o número inteiro imediatamente superior.",
+    "Até 30% das vagas previstas podem ser destinadas a motocicletas.",
+]
+PARKING_NOTES_RES_MULTI = [
+    "Residência multifamiliar: 1 vaga por apartamento quando a unidade for < 90 m²; e 1,5 vaga por apartamento quando a unidade for ≥ 90 m² (Anexo IV).",
+    "Para calcular automaticamente, informe a quantidade de apartamentos e a área média da unidade.",
+]
 
 
 # =============================
@@ -196,19 +217,6 @@ def envelope_area(
     corner_two_fronts: bool,
     attach_one_side: bool,
 ) -> Dict[str, Any]:
-    """
-    Envelope por recuos.
-
-    Meio de quadra:
-      largura_util = testada - (lat_esq + lat_dir)
-      prof_util    = profundidade - frontal - fundo
-
-    Esquina:
-      - se corner_two_fronts=True: considera 2 frentes
-      - assume 1 lado vira "frente secundária" (usa rec_fr)
-      - a outra é "lateral interna" (usa rec_lat)
-      - attach_one_side só zera a lateral interna (nunca a frente secundária)
-    """
     testada = float(testada)
     profundidade = float(profundidade)
     rec_fr = float(rec_fr)
@@ -242,7 +250,6 @@ def envelope_area(
             "esquina_modelo": "esquina_2_frentes",
         }
 
-    # esquina sem 2 frentes => comportamento meio de quadra
     lat_internal = rec_lat
     lat_other = rec_lat
     if attach_one_side:
@@ -314,7 +321,6 @@ def find_zone_for_click(zone_index, lat: float, lon: float):
     props_list = zone_index["props"]
     gid = zone_index["gid"]
 
-    # Shapely 2: índices
     if _tree_returns_indices(candidates):
         for i in candidates:
             try:
@@ -325,7 +331,6 @@ def find_zone_for_click(zone_index, lat: float, lon: float):
                 continue
         return None
 
-    # Shapely 1.x: geometrias
     for g in candidates:
         i = gid.get(id(g))
         if i is None:
@@ -427,7 +432,7 @@ def sb_get_zone_rule(zone_sigla: str, use_type_code: str) -> Optional[Dict[str, 
     """
     Busca regra por:
       1) (zona + uso selecionado)
-      2) fallback p/ RES_UNI quando uso = RES_MULTI (porque você disse que os parâmetros são os mesmos)
+      2) fallback p/ RES_UNI quando uso = RES_MULTI (parâmetros iguais, conforme você informou)
       3) fallback p/ ANY (genérico do sistema)
     """
     if not zone_sigla or not use_type_code:
@@ -454,18 +459,15 @@ def sb_get_zone_rule(zone_sigla: str, use_type_code: str) -> Optional[Dict[str, 
         data = res.data or []
         return data[0] if data else None
 
-    # 1) exata
     rule = _fetch(zone_sigla, use_type_code)
     if rule:
         return rule
 
-    # 2) fallback: multifamiliar usa a mesma regra do unifamiliar (se você ainda não cadastrou RES_MULTI)
     if use_type_code == "RES_MULTI":
         rule = _fetch(zone_sigla, "RES_UNI")
         if rule:
             return rule
 
-    # 3) fallback: ANY (se existir no use_types e zone_rules)
     rule = _fetch(zone_sigla, "ANY")
     if rule:
         return rule
@@ -477,7 +479,6 @@ def sb_get_zone_rule(zone_sigla: str, use_type_code: str) -> Optional[Dict[str, 
 def sb_get_parking_rule(use_type_code: str) -> Optional[Dict[str, Any]]:
     if not use_type_code:
         return None
-    # ✅ inclui rule_json para as regras "json_rule" (multifamiliar)
     res = (
         sb.table("parking_rules")
         .select("use_type_code,metric,value,min_vagas,source_ref,rule_json")
@@ -519,7 +520,6 @@ def compute_urbanism(
     attach_one_side: bool,
     rule: Optional[Dict[str, Any]],
     park: Optional[Dict[str, Any]],
-    # ✅ novos (opcionais, principalmente pra RES_MULTI)
     qtd_unidades: Optional[int] = None,
     area_unidade_m2: Optional[float] = None,
 ) -> Dict[str, Any]:
@@ -589,7 +589,6 @@ def compute_urbanism(
         calc["observacoes"] = rule.get("observacoes")
         calc["source_ref"] = rule.get("source_ref")
 
-        # Envelope (miolo) - só calcula se recuos existem
         if rec_lat is not None and rec_fr is not None and rec_fun is not None:
             env = envelope_area(
                 testada=testada,
@@ -621,7 +620,7 @@ def compute_urbanism(
         calc["pavimentos_estimados"] = estimate_pavimentos(g_pav, g_m)
 
     # =============================
-    # ✅ Vagas (agora com json_rule + modo opcional)
+    # Vagas
     # =============================
     vagas = None
     vagas_texto = None
@@ -639,7 +638,6 @@ def compute_urbanism(
                 vagas = None
 
         elif metric == "per_unit":
-            # exemplo: RES_UNI (fixo por unidade)
             try:
                 vagas = max(int(value), int(min_v or 0))
             except Exception:
@@ -656,7 +654,6 @@ def compute_urbanism(
         elif metric == "json_rule":
             rtype = (rule_json or {}).get("type")
 
-            # RES_MULTI: por área da unidade (com texto sempre, cálculo opcional)
             if rtype == "per_unit_by_unit_area":
                 vagas_texto = (rule_json or {}).get("display_text")
 
@@ -783,14 +780,11 @@ with col_panel:
     st.subheader("2) Dados do lote/projeto")
 
     use_types = sb_list_use_types()
-
-    # ✅ NÃO mostrar "ANY" na UI
     use_options = {
         u["label"]: u["code"]
         for u in use_types
         if u.get("category") == "Residencial" and u.get("code") != "ANY"
     }
-
     if not use_options:
         use_options = {
             "Residencial Unifamiliar (Casa)": "RES_UNI",
@@ -808,7 +802,7 @@ with col_panel:
     if esquina:
         corner_two_fronts = st.checkbox("Considerar 2 frentes (esquina)", value=True)
 
-    # ✅ Multifamiliar (opcional) — para calcular vagas quando o usuário souber
+    # ✅ Multifamiliar (opcional) — só aparece em RES_MULTI
     qtd_unidades = None
     area_unidade_m2 = None
     if use_code == "RES_MULTI":
@@ -818,7 +812,7 @@ with col_panel:
         qtd_unidades = int(qtd_u) if qtd_u and qtd_u > 0 else None
         area_unidade_m2 = float(area_u) if area_u and area_u > 0 else None
 
-    # Encostar (só faz sentido se a regra permitir; após calcular a gente habilita)
+    # ✅ Encostar: agora RES_MULTI segue a mesma regra (depende do allow_attach_one_side)
     last_calc = st.session_state.get("calc") or {}
     last_rule = (last_calc.get("rule") or {}) if isinstance(last_calc, dict) else {}
     allow_attach_last = bool(last_rule.get("allow_attach_one_side") or False)
@@ -935,7 +929,7 @@ if not rule:
 
 
 # =============================
-# Parâmetros da Zona (detalhado) - SUPABASE
+# Parâmetros da Zona
 # =============================
 st.divider()
 st.markdown("## Parâmetros da Zona (detalhado)")
@@ -1022,7 +1016,7 @@ if rule.get("requires_subzone"):
         "<div class='warn'><b>⚠ Zona com subzona/setor</b><br/>"
         "Essa zona tem parâmetros por <b>setor/subzona</b>. "
         "Por enquanto você está usando uma regra <b>genérica</b>. "
-        "Quando quiser, a gente adiciona seleção de setor no app (ZEIS 1/2/3, ZPP 1/2/3, ZEIA 1/2/3/APP, ZEIP 1..9, ZEPE 1/2).</div>",
+        "Quando quiser, a gente adiciona seleção de setor no app.</div>",
         unsafe_allow_html=True,
     )
 
@@ -1111,7 +1105,7 @@ st.markdown(
 )
 
 # =============================
-# ✅ Vagas mínimas (calculado OU texto da regra)
+# Vagas mínimas
 # =============================
 st.divider()
 st.markdown("## Vagas mínimas")
@@ -1143,6 +1137,18 @@ elif calc.get("vagas_texto"):
     )
 else:
     st.caption("Sem regra de estacionamento cadastrada para este uso.")
+
+# Observações importantes
+notes = list(PARKING_NOTES_GENERAL)
+if calc.get("use_code") == "RES_MULTI":
+    notes.extend(PARKING_NOTES_RES_MULTI)
+
+st.markdown(
+    "<div class='note'><b>Observações importantes (Anexo IV)</b><ul>"
+    + "".join([f"<li>{n}</li>" for n in notes])
+    + "</ul></div>",
+    unsafe_allow_html=True,
+)
 
 with st.expander("Debug (raw)"):
     st.write("location:")
