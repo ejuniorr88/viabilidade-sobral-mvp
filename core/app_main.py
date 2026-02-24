@@ -18,6 +18,8 @@ def main():
     from pyproj import Transformer
     
     from supabase import create_client
+
+    from core.report_unifamiliar import build_unifamiliar_report_md
     
     
     # =============================
@@ -1733,7 +1735,22 @@ def main():
         reasons = sim.get("reasons") or []
         if reasons:
             with st.expander("Observações"):
-                for r in reasons:
+             
+        # =============================
+        # Relatório completo (Markdown)
+        # =============================
+        report_md = build_unifamiliar_report_md(res=res, calc=calc, sim=sim)
+        with st.expander("📄 Relatório urbanístico completo (Residencial Unifamiliar)"):
+            st.markdown(report_md)
+            st.download_button(
+                "⬇️ Baixar relatório (.md)",
+                data=report_md,
+                file_name="RELATORIO_UNIFAMILIAR.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
+
+   for r in reasons:
                     st.write(f"- {r}")
     
     else:
