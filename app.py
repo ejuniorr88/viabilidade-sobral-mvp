@@ -166,20 +166,50 @@ def fmt_m2(x: Optional[float]) -> str:
         return "—"
 
 
-def is_res_uni(use_code: str, use_label: str) -> bool:
-    c = (use_code or "").upper().strip()
-    l = (use_label or "").lower().strip()
-    return c.startswith("RES_UNI") or ("unifamiliar" in l) or ("casa" in l)
+# -----------------------------
+# Robust residential detectors
+# (fix: garantir que "para leigo" apareça mesmo se codes/labels variam)
+# -----------------------------
+def _norm(s: str) -> str:
+    return (s or "").strip()
+
+def _norm_l(s: str) -> str:
+    return _norm(s).lower()
+
+def is_res_uni(use_code: str, use_label: str, use_category: str = "") -> bool:
+    c = _norm(use_code).upper()
+    l = _norm_l(use_label)
+    cat = _norm_l(use_category)
+    # code patterns
+    if c.startswith("RES_UNI") or c in ("RESUNI", "RES_UNIF", "RES_UNIFAMILIAR"):
+        return True
+    if c.startswith("RES") and ("UNI" in c or "UNIF" in c):
+        return True
+    # label/category patterns
+    if "unifamiliar" in l or ("casa" in l and "res" in l):
+        return True
+    if cat == "residencial" and ("unifamiliar" in l or "casa" in l):
+        return True
+    return False
 
 
-def is_res_multi(use_code: str, use_label: str) -> bool:
-    c = (use_code or "").upper().strip()
-    l = (use_label or "").lower().strip()
-    return c.startswith("RES_MULTI") or ("multifamiliar" in l) or ("prédio" in l) or ("predio" in l)
+def is_res_multi(use_code: str, use_label: str, use_category: str = "") -> bool:
+    c = _norm(use_code).upper()
+    l = _norm_l(use_label)
+    cat = _norm_l(use_category)
+    if c.startswith("RES_MULTI") or c in ("RESMULTI", "RES_MF", "RES_MULTIFAMILIAR"):
+        return True
+    if c.startswith("RES") and ("MULTI" in c or "MF" in c):
+        return True
+    if "multifamiliar" in l or "prédio" in l or "predio" in l or ("apartamento" in l and "res" in l):
+        return True
+    if cat == "residencial" and ("multifamiliar" in l or "prédio" in l or "predio" in l or "apartamento" in l):
+        return True
+    return False
 
 
-def is_res_any(use_code: str, use_label: str) -> bool:
-    return is_res_uni(use_code, use_label) or is_res_multi(use_code, use_label)
+def is_res_any(use_code: str, use_label: str, use_category: str = "") -> bool:
+    return is_res_uni(use_code, use_label, use_category) or is_res_multi(use_code, use_label, use_category)
 
 
 def popup_html(result: dict | None):
@@ -266,7 +296,7 @@ def envelope_area(
 
 
 # =============================
-# NEW: Sanitários (Anexo III) + Estacionamento v2 (Anexo IV)
+# Sanitários (Anexo III) + Estacionamento v2 (Anexo IV)
 # =============================
 def _parse_formula_divisor(formula: str) -> Optional[float]:
     # "1/300,00m² ou fração" -> 300.0
@@ -1199,7 +1229,7 @@ with col_panel:
     # Multifamiliar (opcional do motor antigo)
     qtd_unidades = None
     area_unidade_m2 = None
-    if is_res_multi(use_code, use_label):
+    if is_res_multi(use_code, use_label, use_category):
         st.subheader("Dados do multifamiliar (opcional • motor antigo)")
         qtd_u = st.number_input("Quantidade de apartamentos (opcional)", min_value=0, value=0, step=1)
         area_u = st.number_input("Área média do apartamento (m²) (opcional)", min_value=0.0, value=0.0, step=5.0)
@@ -1211,7 +1241,7 @@ with col_panel:
     last_rule = (last_calc.get("rule") or {}) if isinstance(last_calc, dict) else {}
     allow_attach_last = bool(last_rule.get("allow_attach_one_side") or False)
 
-    disabled_attach = is_res_multi(use_code, use_label) or (not allow_attach_last)
+    disabled_attach = is_res_multi(use_code, use_label, use_category) or (not allow_attach_last)
 
     st.session_state["attach_one_side"] = st.checkbox(
         "Encostar em 1 lateral (zerar recuo)",
@@ -1226,37 +1256,85 @@ with col_panel:
     park_v2_preview = sb_get_parking_rule_v2(use_code)
     base_metric = (park_v2_preview or {}).get("base_metric")
 
-    st.subheader("Dados complementares (Anexos III e IV)")
+    st.subheader("Dados para vagas e sanitários")
 
-    near_vlt = st.checkbox("Está a até 250m de estação VLT? (pode reduzir vagas em até 20%)", value=False)
-    is_via_local = st.checkbox("O imóvel está em via local? (dispensa não residencial ≤ 100m² área útil)", value=False)
+    # Para deixar o fluxo mais clean:
+    # - "Via local" só faz sentido para usos NÃO residenciais (dispensa ≤ 100m² em via local).
+    # - VLT vira um ajuste opcional nos RESULTADOS (não aparece aqui).
+    is_res_selected = is_res_any(use_code, use_label)
 
-    # Sempre oferece área útil (porque você quer isso também para residência)
-    area_util_m2 = st.number_input("Área útil (m²) (para vagas e sanitários)", min_value=0.0, value=0.0, step=10.0)
+    near_vlt = False  # aplicado (opcional) nos resultados
 
+    is_via_local = False
+    if not is_res_selected:
+        is_via_local = st.checkbox(
+            "O imóvel está em via local? (dispensa não residencial ≤ 100m² área útil)",
+            value=False
+        )
+
+    # defaults
+    area_util_m2 = 0.0
     lugares = 0
     leitos = 0
     unidades_hospedagem = 0
     apartamentos = 0
     apto_area_m2 = 0.0
 
-    # Inputs adicionais quando a regra v2 exigir outra métrica
-    if base_metric == "lugares":
-        lugares = st.number_input("Quantidade de lugares", min_value=0, value=0, step=1)
-    elif base_metric == "leitos":
-        leitos = st.number_input("Quantidade de leitos", min_value=0, value=0, step=1)
-    elif base_metric == "unidades_hospedagem":
-        unidades_hospedagem = st.number_input("Unidades de hospedagem (UH)", min_value=0, value=0, step=1)
-    elif base_metric in ("apartamentos",):
-        apartamentos = st.number_input("Quantidade de apartamentos (para estacionamento v2)", min_value=0, value=0, step=1)
-        apto_area_m2 = st.number_input("Área construída média do apartamento (m²) (para estacionamento v2)", min_value=0.0, value=0.0, step=5.0)
+    # Para residencial, esconder esses dados em 'Opções avançadas' (evita confusão para leigo)
+    if is_res_selected:
+        with st.expander("Opções avançadas (opcional) • Dados para vagas/sanitários", expanded=False):
+            area_util_m2 = st.number_input(
+                "Área útil (m²) (para vagas e sanitários)",
+                min_value=0.0,
+                value=0.0,
+                step=10.0
+            )
+
+            if base_metric == "lugares":
+                lugares = st.number_input("Quantidade de lugares", min_value=0, value=0, step=1)
+            elif base_metric == "leitos":
+                leitos = st.number_input("Quantidade de leitos", min_value=0, value=0, step=1)
+            elif base_metric == "unidades_hospedagem":
+                unidades_hospedagem = st.number_input("Unidades de hospedagem (UH)", min_value=0, value=0, step=1)
+            elif base_metric in ("apartamentos",):
+                apartamentos = st.number_input("Quantidade de apartamentos (para estacionamento v2)", min_value=0, value=0, step=1)
+                apto_area_m2 = st.number_input(
+                    "Área construída média do apartamento (m²) (para estacionamento v2)",
+                    min_value=0.0,
+                    value=0.0,
+                    step=5.0
+                )
+    else:
+        # Não residencial: mostrar direto, porque pode ser obrigatório para calcular vagas/sanitários
+        area_util_m2 = st.number_input(
+            "Área útil (m²) (para vagas e sanitários)",
+            min_value=0.0,
+            value=0.0,
+            step=10.0
+        )
+
+        if base_metric == "lugares":
+            lugares = st.number_input("Quantidade de lugares", min_value=0, value=0, step=1)
+        elif base_metric == "leitos":
+            leitos = st.number_input("Quantidade de leitos", min_value=0, value=0, step=1)
+        elif base_metric == "unidades_hospedagem":
+            unidades_hospedagem = st.number_input("Unidades de hospedagem (UH)", min_value=0, value=0, step=1)
+        elif base_metric in ("apartamentos",):
+            apartamentos = st.number_input("Quantidade de apartamentos (para estacionamento v2)", min_value=0, value=0, step=1)
+            apto_area_m2 = st.number_input(
+                "Área construída média do apartamento (m²) (para estacionamento v2)",
+                min_value=0.0,
+                value=0.0,
+                step=5.0
+            )
+
 
     # =============================
     # Simulação “para leigo” (Residencial)
     # =============================
     desired_total_area_m2 = 0.0
     desired_pavimentos = 0
-    if is_res_any(use_code, use_label):
+    if is_res_any(use_code, use_label, use_category):
         st.subheader("Simulação do projeto (para leigo)")
         desired_total_area_m2 = st.number_input(
             "Área construída TOTAL desejada (m²) — opcional (0 = usar o máximo permitido)",
@@ -1290,7 +1368,7 @@ with col_panel:
             san_prof = sb_get_sanitary_profile((use_prof or {}).get("sanitary_profile"))
 
             allow_attach_now = bool((rule or {}).get("allow_attach_one_side") or False)
-            attach_one_side = bool(st.session_state.get("attach_one_side", False)) and allow_attach_now and (not is_res_multi(use_code, use_label))
+            attach_one_side = bool(st.session_state.get("attach_one_side", False)) and allow_attach_now and (not is_res_multi(use_code, use_label, use_category))
 
             calc = compute_urbanism(
                 zone_sigla=zona_sigla,
@@ -1307,10 +1385,28 @@ with col_panel:
                 area_unidade_m2=area_unidade_m2,
             )
 
-            parking_inputs = {
-                "near_vlt": bool(near_vlt),
-                "is_via_local": bool(is_via_local),
+            # store category + last simulation inputs (fix: possibilita recomputar/mostrar sempre)
+            calc["use_category"] = use_category
+            calc["_inputs_leigo"] = {
+                "desired_total_area_m2": float(desired_total_area_m2 or 0),
+                "desired_pavimentos": int(desired_pavimentos or 0),
                 "area_util_m2": float(area_util_m2 or 0),
+            }
+
+            parking_area_util = float(area_util_m2 or 0)
+
+            # Se o usuário não informar área útil em RESIDENCIAL, a gente assume uma área útil
+            # para conseguir calcular vagas (default: área total simulada / máximo pelo IA).
+            if is_res_any(use_code, use_label) and parking_area_util <= 0:
+                if float(desired_total_area_m2 or 0) > 0:
+                    parking_area_util = float(desired_total_area_m2)
+                else:
+                    parking_area_util = float(calc.get("area_max_total_construida") or 0)
+
+            parking_inputs = {
+                "near_vlt": False,  # ajuste opcional nos resultados
+                "is_via_local": bool(is_via_local),
+                "area_util_m2": float(parking_area_util or 0),
                 "lugares": int(lugares or 0),
                 "leitos": int(leitos or 0),
                 "unidades_hospedagem": int(unidades_hospedagem or 0),
@@ -1321,9 +1417,11 @@ with col_panel:
             if park_v2 and (park_v2.get("rule_json") or {}).get("use_code"):
                 pv2 = calc_parking_v2(park_v2["rule_json"], parking_inputs)
                 calc["parking_v2"] = pv2
+                calc["parking_v2_rule_json"] = park_v2["rule_json"]
                 calc["parking_v2_source_ref"] = park_v2.get("source_ref")
             else:
                 calc["parking_v2"] = None
+                calc["parking_v2_rule_json"] = None
                 calc["parking_v2_source_ref"] = None
 
             if san_prof and san_prof.get("rule_json") and float(area_util_m2 or 0) > 0:
@@ -1338,7 +1436,7 @@ with col_panel:
                 calc["sanitary"] = None
 
             # Simulação “para leigo” (Residencial Uni/Multi)
-            if is_res_any(use_code, use_label):
+            if is_res_any(use_code, use_label, use_category):
                 calc["simulacao_leigo"] = build_leigo_simulation(
                     calc=calc,
                     desired_total_area_m2=float(desired_total_area_m2 or 0),
@@ -1425,9 +1523,25 @@ if not rule:
 
 # =============================
 # Viabilidade “para leigo” (Uni e Multi)
+# FIX: renderiza sempre que for residencial; se sim não existir, recalcula com inputs salvos.
 # =============================
-sim = calc.get("simulacao_leigo")
-if sim and is_res_any(calc.get("use_code"), calc.get("use_label")):
+use_code_r = calc.get("use_code") or ""
+use_label_r = calc.get("use_label") or ""
+use_cat_r = calc.get("use_category") or use_category if "use_category" in globals() else ""
+
+if is_res_any(use_code_r, use_label_r, use_cat_r):
+    sim = calc.get("simulacao_leigo")
+    if not sim:
+        # tenta recomputar com últimos inputs salvos
+        last_in = (calc.get("_inputs_leigo") or {})
+        sim = build_leigo_simulation(
+            calc=calc,
+            desired_total_area_m2=float(last_in.get("desired_total_area_m2") or 0),
+            desired_pavimentos=int(last_in.get("desired_pavimentos") or 0),
+            area_util_m2=float(last_in.get("area_util_m2") or 0),
+        )
+        calc["simulacao_leigo"] = sim
+
     st.divider()
     st.markdown("## ✅ Viabilidade (para leigo)")
 
@@ -1613,6 +1727,33 @@ st.divider()
 st.markdown("## Vagas mínimas")
 
 pv2 = calc.get("parking_v2")
+pv2_rule_json = calc.get("parking_v2_rule_json")
+
+# 🚈 VLT como informação adicional (e ajuste opcional)
+apply_vlt_adjust = False
+if pv2 and pv2.get("required") is not None and pv2_rule_json:
+    st.markdown(
+        """
+        <div class="card" style="margin-bottom:10px;">
+          <h4>🚈 Proximidade de VLT (informação adicional)</h4>
+          <div class="muted">
+            Se o imóvel estiver a até <b>250m</b> de uma estação de VLT, o Anexo IV permite <b>reduzir até 20%</b> das vagas.
+            Marque abaixo apenas se isso se aplicar ao seu caso.
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    apply_vlt_adjust = st.checkbox(
+        "Aplicar redução por VLT (–20%)",
+        value=bool(st.session_state.get("apply_vlt_adjust", False)),
+    )
+    st.session_state["apply_vlt_adjust"] = apply_vlt_adjust
+
+    if apply_vlt_adjust:
+        _inputs = dict(pv2.get("inputs") or {})
+        _inputs["near_vlt"] = True
+        pv2 = calc_parking_v2(pv2_rule_json, _inputs)
 
 if pv2 and pv2.get("required") is not None:
     adj = pv2.get("adjustments") or []
