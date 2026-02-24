@@ -166,6 +166,22 @@ def fmt_m2(x: Optional[float]) -> str:
         return "—"
 
 
+def is_res_uni(use_code: str, use_label: str) -> bool:
+    c = (use_code or "").upper().strip()
+    l = (use_label or "").lower().strip()
+    return c.startswith("RES_UNI") or ("unifamiliar" in l) or ("casa" in l)
+
+
+def is_res_multi(use_code: str, use_label: str) -> bool:
+    c = (use_code or "").upper().strip()
+    l = (use_label or "").lower().strip()
+    return c.startswith("RES_MULTI") or ("multifamiliar" in l) or ("prédio" in l) or ("predio" in l)
+
+
+def is_res_any(use_code: str, use_label: str) -> bool:
+    return is_res_uni(use_code, use_label) or is_res_multi(use_code, use_label)
+
+
 def popup_html(result: dict | None):
     if not result:
         return """
@@ -365,7 +381,9 @@ def calc_parking_v2(rule_json: dict, inputs: Dict[str, Any]) -> Dict[str, Any]:
 
     # Dispensa: não residencial até 100m² em via local (quando base = área útil)
     if inputs.get("is_via_local") and base_metric == "area_util_m2":
-        if 0 < area <= 100 and (rule_json.get("use_code") or "").upper() not in ("RESIDENCIAS_MULTIFAMILIARES", "RES_MULTI"):
+        usec = (rule_json.get("use_code") or "").upper()
+        is_res = usec.startswith("RES_UNI") or usec.startswith("RES_MULTI") or ("RESIDEN" in usec)
+        if (0 < area <= 100) and (not is_res):
             out["raw"] = 0.0
             out["required"] = 0
             out["applied_rule_text"] = "Dispensa: não residencial ≤ 100m² em via local."
@@ -413,12 +431,10 @@ def calc_parking_v2(rule_json: dict, inputs: Dict[str, Any]) -> Dict[str, Any]:
                 break
 
         elif rtype in ("threshold_fixed", "fixed_or_band"):
-            # threshold_fixed (v2)
             if base_metric != "area_util_m2":
                 continue
             mx = r.get("max_m2", None)
             if mx is None:
-                # fixed_or_band textual: não dá pra calcular
                 out["notes"].append("Regra textual (fixed_or_band) - precisa padronizar em JSON calculável.")
                 continue
             mx = float(mx)
@@ -928,6 +944,113 @@ def compute_urbanism(
     return calc
 
 
+def build_leigo_simulation(calc: Dict[str, Any], desired_total_area_m2: float, desired_pavimentos: int, area_util_m2: float) -> Dict[str, Any]:
+    """
+    Simulação “para leigo” para RES_UNI e RES_MULTI.
+    - Se desired_total_area_m2 == 0, usa máximo pelo IA.
+    - Se desired_pavimentos == 0, usa pavimentos estimados (gabarito) ou 1.
+    """
+    rule = calc.get("rule") or {}
+    area_lote = float(calc.get("area_lote") or 0)
+
+    to_max = rule.get("to_max")
+    tp_min = rule.get("tp_min")
+    ia_max = rule.get("ia_max")
+    ia_min = rule.get("ia_min")
+
+    area_max_total = calc.get("area_max_total_construida")
+    area_min_perm = calc.get("area_min_permeavel")
+    area_max_ocup_real = calc.get("area_max_ocupacao_real")
+
+    pav_est = calc.get("pavimentos_estimados") or 1
+    pav = int(desired_pavimentos or 0) if desired_pavimentos else int(pav_est or 1)
+    pav = max(pav, 1)
+
+    # total desejado
+    if desired_total_area_m2 and desired_total_area_m2 > 0:
+        total_proj = float(desired_total_area_m2)
+        total_proj_mode = "informado"
+    else:
+        total_proj = float(area_max_total or 0)
+        total_proj_mode = "máximo pelo IA"
+
+    # pegada no térreo (TO) aproximada (divide pela quantidade de pavimentos)
+    footprint_proj = (total_proj / pav) if pav > 0 else total_proj
+
+    # área útil (para estacionamento/sanitários) - se não informar, usa a mesma lógica do total
+    if area_util_m2 and area_util_m2 > 0:
+        area_util_used = float(area_util_m2)
+        area_util_mode = "informada"
+    else:
+        area_util_used = float(total_proj)
+        area_util_mode = "assumida = área construída total"
+
+    # checks de viabilidade
+    checks = {
+        "has_to": to_max is not None and area_max_ocup_real is not None,
+        "has_tp": tp_min is not None and area_min_perm is not None,
+        "has_ia": ia_max is not None and area_max_total is not None,
+    }
+
+    ok_to = None
+    if checks["has_to"]:
+        ok_to = footprint_proj <= float(area_max_ocup_real)
+
+    ok_ia = None
+    if checks["has_ia"]:
+        ok_ia = total_proj <= float(area_max_total)
+
+    # TP é “mínimo de área livre permeável”; aqui só informamos o valor exigido
+    ok_tp = checks["has_tp"]
+
+    # viável se (quando houver dados): IA ok e TO ok
+    viable = True
+    reasons = []
+    if checks["has_ia"] and ok_ia is False:
+        viable = False
+        reasons.append("Área total construída acima do máximo permitido pelo IA.")
+    if checks["has_to"] and ok_to is False:
+        viable = False
+        reasons.append("Área ocupada no térreo acima do máximo permitido pela TO (considerando recuos).")
+    if not checks["has_ia"]:
+        reasons.append("IA máximo não cadastrado para esta combinação (não dá pra afirmar o máximo com segurança).")
+    if not checks["has_to"]:
+        reasons.append("TO/recuos não cadastrados o suficiente para checar a pegada no térreo com segurança.")
+    if not checks["has_tp"]:
+        reasons.append("TP (permeabilidade mínima) não cadastrado o suficiente para calcular a área permeável.")
+
+    return {
+        "pavimentos_usados": pav,
+        "pavimentos_mode": "informado" if desired_pavimentos and desired_pavimentos > 0 else "estimado pelo gabarito",
+        "total_proj_m2": total_proj,
+        "total_proj_mode": total_proj_mode,
+        "footprint_proj_m2": footprint_proj,
+        "area_util_m2": area_util_used,
+        "area_util_mode": area_util_mode,
+        "limits": {
+            "to_max_pct": to_max,
+            "tp_min_pct": tp_min,
+            "ia_min": ia_min,
+            "ia_max": ia_max,
+            "area_max_ocup_real_m2": area_max_ocup_real,
+            "area_min_permeavel_m2": area_min_perm,
+            "area_max_total_construida_m2": area_max_total,
+        },
+        "checks": {
+            "ok_to": ok_to,
+            "ok_ia": ok_ia,
+            "has_tp": checks["has_tp"],
+        },
+        "viable": viable,
+        "reasons": reasons,
+        "explain": {
+            "to": "TO (Taxa de Ocupação) limita o quanto do terreno pode ser ocupado no térreo.",
+            "tp": "TP (Taxa de Permeabilidade) exige uma área mínima do lote que deve ficar permeável (solo).",
+            "ia": "IA (Índice de Aproveitamento) limita a área construída total somando todos os pavimentos.",
+        }
+    }
+
+
 # =============================
 # Dados (arquivos)
 # =============================
@@ -1076,7 +1199,7 @@ with col_panel:
     # Multifamiliar (opcional do motor antigo)
     qtd_unidades = None
     area_unidade_m2 = None
-    if use_code == "RES_MULTI":
+    if is_res_multi(use_code, use_label):
         st.subheader("Dados do multifamiliar (opcional • motor antigo)")
         qtd_u = st.number_input("Quantidade de apartamentos (opcional)", min_value=0, value=0, step=1)
         area_u = st.number_input("Área média do apartamento (m²) (opcional)", min_value=0.0, value=0.0, step=5.0)
@@ -1088,7 +1211,7 @@ with col_panel:
     last_rule = (last_calc.get("rule") or {}) if isinstance(last_calc, dict) else {}
     allow_attach_last = bool(last_rule.get("allow_attach_one_side") or False)
 
-    disabled_attach = (use_code == "RES_MULTI") or (not allow_attach_last)
+    disabled_attach = is_res_multi(use_code, use_label) or (not allow_attach_last)
 
     st.session_state["attach_one_side"] = st.checkbox(
         "Encostar em 1 lateral (zerar recuo)",
@@ -1108,27 +1231,45 @@ with col_panel:
     near_vlt = st.checkbox("Está a até 250m de estação VLT? (pode reduzir vagas em até 20%)", value=False)
     is_via_local = st.checkbox("O imóvel está em via local? (dispensa não residencial ≤ 100m² área útil)", value=False)
 
-    area_util_m2 = 0.0
+    # Sempre oferece área útil (porque você quer isso também para residência)
+    area_util_m2 = st.number_input("Área útil (m²) (para vagas e sanitários)", min_value=0.0, value=0.0, step=10.0)
+
     lugares = 0
     leitos = 0
     unidades_hospedagem = 0
     apartamentos = 0
     apto_area_m2 = 0.0
 
-    if base_metric in (None, "", "area_util_m2"):
-        area_util_m2 = st.number_input("Área útil (m²) (para vagas e sanitários)", min_value=0.0, value=0.0, step=10.0)
-    elif base_metric == "lugares":
+    # Inputs adicionais quando a regra v2 exigir outra métrica
+    if base_metric == "lugares":
         lugares = st.number_input("Quantidade de lugares", min_value=0, value=0, step=1)
     elif base_metric == "leitos":
         leitos = st.number_input("Quantidade de leitos", min_value=0, value=0, step=1)
     elif base_metric == "unidades_hospedagem":
         unidades_hospedagem = st.number_input("Unidades de hospedagem (UH)", min_value=0, value=0, step=1)
     elif base_metric in ("apartamentos",):
-        apartamentos = st.number_input("Quantidade de apartamentos", min_value=0, value=0, step=1)
-        apto_area_m2 = st.number_input("Área construída média do apartamento (m²)", min_value=0.0, value=0.0, step=5.0)
-    else:
-        # fallback: sempre oferece área útil
-        area_util_m2 = st.number_input("Área útil (m²) (fallback)", min_value=0.0, value=0.0, step=10.0)
+        apartamentos = st.number_input("Quantidade de apartamentos (para estacionamento v2)", min_value=0, value=0, step=1)
+        apto_area_m2 = st.number_input("Área construída média do apartamento (m²) (para estacionamento v2)", min_value=0.0, value=0.0, step=5.0)
+
+    # =============================
+    # Simulação “para leigo” (Residencial)
+    # =============================
+    desired_total_area_m2 = 0.0
+    desired_pavimentos = 0
+    if is_res_any(use_code, use_label):
+        st.subheader("Simulação do projeto (para leigo)")
+        desired_total_area_m2 = st.number_input(
+            "Área construída TOTAL desejada (m²) — opcional (0 = usar o máximo permitido)",
+            min_value=0.0,
+            value=0.0,
+            step=10.0
+        )
+        desired_pavimentos = st.number_input(
+            "Pavimentos desejados — opcional (0 = usar gabarito/estimativa)",
+            min_value=0,
+            value=0,
+            step=1
+        )
 
     st.subheader("Calcular")
 
@@ -1149,7 +1290,7 @@ with col_panel:
             san_prof = sb_get_sanitary_profile((use_prof or {}).get("sanitary_profile"))
 
             allow_attach_now = bool((rule or {}).get("allow_attach_one_side") or False)
-            attach_one_side = bool(st.session_state.get("attach_one_side", False)) and allow_attach_now and (use_code != "RES_MULTI")
+            attach_one_side = bool(st.session_state.get("attach_one_side", False)) and allow_attach_now and (not is_res_multi(use_code, use_label))
 
             calc = compute_urbanism(
                 zone_sigla=zona_sigla,
@@ -1195,6 +1336,17 @@ with col_panel:
                 }
             else:
                 calc["sanitary"] = None
+
+            # Simulação “para leigo” (Residencial Uni/Multi)
+            if is_res_any(use_code, use_label):
+                calc["simulacao_leigo"] = build_leigo_simulation(
+                    calc=calc,
+                    desired_total_area_m2=float(desired_total_area_m2 or 0),
+                    desired_pavimentos=int(desired_pavimentos or 0),
+                    area_util_m2=float(area_util_m2 or 0),
+                )
+            else:
+                calc["simulacao_leigo"] = None
 
             st.session_state["calc"] = calc
 
@@ -1270,6 +1422,100 @@ if not rule:
     st.warning(f"Sem regra cadastrada no Supabase para **{calc.get('zona_sigla')} + {calc.get('use_code')}**.")
     st.caption("Cadastre em `zone_rules` e tente novamente.")
     st.stop()
+
+# =============================
+# Viabilidade “para leigo” (Uni e Multi)
+# =============================
+sim = calc.get("simulacao_leigo")
+if sim and is_res_any(calc.get("use_code"), calc.get("use_label")):
+    st.divider()
+    st.markdown("## ✅ Viabilidade (para leigo)")
+
+    viable = bool(sim.get("viable"))
+    reasons = sim.get("reasons") or []
+
+    # pega vagas (prioriza v2)
+    pv2 = calc.get("parking_v2")
+    vagas_txt = "—"
+    if pv2 and pv2.get("required") is not None:
+        vagas_txt = str(int(pv2.get("required")))
+    elif calc.get("vagas_min") is not None:
+        vagas_txt = str(int(calc.get("vagas_min")))
+
+    # sanitários totais, se existir
+    san = calc.get("sanitary") or {}
+    san_totals = (san.get("result") or {}).get("totals") or {}
+    san_txt = "—"
+    if san_totals:
+        san_txt = (
+            f"Lavatórios {san_totals.get('lavatórios','—')} • "
+            f"Aparelhos {san_totals.get('aparelhos_sanitários','—')} • "
+            f"Mictórios {san_totals.get('mictórios','—')} • "
+            f"Chuveiros {san_totals.get('chuveiros','—')}"
+        )
+
+    status_html = (
+        "<div class='ok'><b>✅ Viável</b><br/>Pelos dados cadastrados, a simulação cabe nos limites da zona.</div>"
+        if viable
+        else "<div class='warn'><b>⚠️ Não viável</b><br/>A simulação ultrapassa algum limite (TO e/ou IA).</div>"
+    )
+    st.markdown(status_html, unsafe_allow_html=True)
+
+    lim = sim.get("limits") or {}
+
+    # explicação simples + números
+    st.markdown(
+        f"""
+        <div class="card" style="margin-top:10px;">
+          <h4>Como ler esses números</h4>
+          <div class="muted"><b>TO</b>: quanto pode ocupar no térreo • <b>TP</b>: quanto precisa ficar permeável • <b>IA</b>: quanto pode construir no total (soma dos pavimentos)</div>
+
+          <hr style="margin:10px 0;" />
+
+          <div class="muted">TO (máx)</div>
+          <div class="big">{fmt_pct(lim.get("to_max_pct"))}</div>
+          <div class="muted">Máx. no térreo (considerando recuos)</div>
+          <div class="big">{fmt_m2(lim.get("area_max_ocup_real_m2"))}</div>
+          <div class="muted">Projeto no térreo (aprox.) = Área total ÷ Pavimentos</div>
+          <div class="big">{fmt_m2(sim.get("footprint_proj_m2"))}</div>
+
+          <hr style="margin:10px 0;" />
+
+          <div class="muted">TP / Permeabilidade (mín)</div>
+          <div class="big">{fmt_pct(lim.get("tp_min_pct"))}</div>
+          <div class="muted">Área mínima permeável</div>
+          <div class="big">{fmt_m2(lim.get("area_min_permeavel_m2"))}</div>
+
+          <hr style="margin:10px 0;" />
+
+          <div class="muted">IA (máx)</div>
+          <div class="big">{lim.get("ia_max") if lim.get("ia_max") is not None else "—"}</div>
+          <div class="muted">Máx. de área construída total</div>
+          <div class="big">{fmt_m2(lim.get("area_max_total_construida_m2"))}</div>
+
+          <hr style="margin:10px 0;" />
+
+          <div class="muted">Simulação usada</div>
+          <div class="big">Área total: {fmt_m2(sim.get("total_proj_m2"))} <span class="muted">({sim.get("total_proj_mode")})</span></div>
+          <div class="big">Pavimentos: {sim.get("pavimentos_usados")} <span class="muted">({sim.get("pavimentos_mode")})</span></div>
+          <div class="muted" style="margin-top:8px;">Área útil (vagas/sanitários)</div>
+          <div class="big">{fmt_m2(sim.get("area_util_m2"))} <span class="muted">({sim.get("area_util_mode")})</span></div>
+
+          <hr style="margin:10px 0;" />
+
+          <div class="muted">Vagas mínimas</div>
+          <div class="big">{vagas_txt}</div>
+          <div class="muted" style="margin-top:8px;">Sanitários mínimos (se houver perfil)</div>
+          <div class="big" style="font-size:16px;">{san_txt}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if reasons:
+        with st.expander("Detalhes / Observações da viabilidade"):
+            for r in reasons:
+                st.write(f"- {r}")
 
 st.divider()
 st.markdown("## Parâmetros da Zona (detalhado)")
@@ -1478,3 +1724,5 @@ with st.expander("Debug (raw)"):
     st.json(calc.get("parking_v2") or {})
     st.write("sanitary:")
     st.json(calc.get("sanitary") or {})
+    st.write("simulacao_leigo:")
+    st.json(calc.get("simulacao_leigo") or {})
