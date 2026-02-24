@@ -1328,28 +1328,47 @@ with col_panel:
                 step=5.0
             )
 
-
     # =============================
     # Simulação “para leigo” (Residencial)
     # =============================
     desired_total_area_m2 = 0.0
     desired_pavimentos = 0
+
     if is_res_any(use_code, use_label, use_category):
         st.subheader("Simulação do projeto (para leigo)")
+
+        # Unifamiliar: tipologia (térreo/duplex/triplex/outro) define pavimentos
+        if is_res_uni(use_code, use_label, use_category):
+            tip_options = ["Térreo", "Duplex", "Triplex", "Outro"]
+            tip_default = st.session_state.get("res_uni_tipologia") or "Térreo"
+            if tip_default not in tip_options:
+                tip_default = "Térreo"
+            tipologia = st.selectbox("Tipo de residência", tip_options, index=tip_options.index(tip_default))
+            st.session_state["res_uni_tipologia"] = tipologia
+
+            if tipologia == "Outro":
+                desired_pavimentos = st.number_input("Quantos pavimentos?", min_value=1, value=1, step=1)
+            else:
+                desired_pavimentos = {"Térreo": 1, "Duplex": 2, "Triplex": 3}[tipologia]
+
+        # Multifamiliar: ainda permite informar pavimentos (ou usar gabarito/estimativa)
+        else:
+            desired_pavimentos = st.number_input(
+                "Pavimentos desejados — opcional (0 = usar gabarito/estimativa)",
+                min_value=0,
+                value=0,
+                step=1
+            )
+
         desired_total_area_m2 = st.number_input(
             "Área construída TOTAL desejada (m²) — opcional (0 = usar o máximo permitido)",
             min_value=0.0,
             value=0.0,
             step=10.0
         )
-        desired_pavimentos = st.number_input(
-            "Pavimentos desejados — opcional (0 = usar gabarito/estimativa)",
-            min_value=0,
-            value=0,
-            step=1
-        )
 
     st.subheader("Calcular")
+
 
     if st.button("🚀 GERAR ESTUDO DE VIABILIDADE", use_container_width=True):
         with st.spinner("Calculando..."):
@@ -1393,20 +1412,32 @@ with col_panel:
                 "area_util_m2": float(area_util_m2 or 0),
             }
 
-            parking_area_util = float(area_util_m2 or 0)
+            # Simulação “para leigo” (Residencial Uni/Multi) — gera também uma área útil "automática"
+            sim_leigo = None
+            if is_res_any(use_code, use_label, use_category):
+                sim_leigo = build_leigo_simulation(
+                    calc=calc,
+                    desired_total_area_m2=float(desired_total_area_m2 or 0),
+                    desired_pavimentos=int(desired_pavimentos or 0),
+                    area_util_m2=float(area_util_m2 or 0),
+                )
+                calc["simulacao_leigo"] = sim_leigo
+            else:
+                calc["simulacao_leigo"] = None
 
-            # Se o usuário não informar área útil em RESIDENCIAL, a gente assume uma área útil
-            # para conseguir calcular vagas (default: área total simulada / máximo pelo IA).
-            if is_res_any(use_code, use_label) and parking_area_util <= 0:
-                if float(desired_total_area_m2 or 0) > 0:
-                    parking_area_util = float(desired_total_area_m2)
-                else:
-                    parking_area_util = float(calc.get("area_max_total_construida") or 0)
+            # Área útil efetiva para vagas/sanitários:
+            # - se o usuário informou, usamos;
+            # - se não informou e for residencial, assumimos a área do próprio estudo (simulação).
+            effective_area_util = float(area_util_m2 or 0)
+            if sim_leigo:
+                effective_area_util = float(sim_leigo.get("area_util_m2") or effective_area_util)
+
+            calc["effective_area_util_m2"] = effective_area_util
 
             parking_inputs = {
                 "near_vlt": False,  # ajuste opcional nos resultados
                 "is_via_local": bool(is_via_local),
-                "area_util_m2": float(parking_area_util or 0),
+                "area_util_m2": float(effective_area_util or 0),
                 "lugares": int(lugares or 0),
                 "leitos": int(leitos or 0),
                 "unidades_hospedagem": int(unidades_hospedagem or 0),
@@ -1424,8 +1455,8 @@ with col_panel:
                 calc["parking_v2_rule_json"] = None
                 calc["parking_v2_source_ref"] = None
 
-            if san_prof and san_prof.get("rule_json") and float(area_util_m2 or 0) > 0:
-                sres = calc_sanitary(san_prof["rule_json"], float(area_util_m2))
+            if san_prof and san_prof.get("rule_json") and float(effective_area_util or 0) > 0:
+                sres = calc_sanitary(san_prof["rule_json"], float(effective_area_util))
                 calc["sanitary"] = {
                     "profile": san_prof.get("sanitary_profile"),
                     "title": san_prof.get("title"),
@@ -1435,16 +1466,6 @@ with col_panel:
             else:
                 calc["sanitary"] = None
 
-            # Simulação “para leigo” (Residencial Uni/Multi)
-            if is_res_any(use_code, use_label, use_category):
-                calc["simulacao_leigo"] = build_leigo_simulation(
-                    calc=calc,
-                    desired_total_area_m2=float(desired_total_area_m2 or 0),
-                    desired_pavimentos=int(desired_pavimentos or 0),
-                    area_util_m2=float(area_util_m2 or 0),
-                )
-            else:
-                calc["simulacao_leigo"] = None
 
             st.session_state["calc"] = calc
 
