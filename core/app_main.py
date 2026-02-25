@@ -899,6 +899,78 @@ def main():
                 calc["area_max_ocupacao_real"] = min(float(area_to), float(area_miolo))
             else:
                 calc["area_max_ocupacao_real"] = area_to if area_to is not None else area_miolo
+            # =============================
+            # Opções de implantação (Relatório - Unifamiliar)
+            # Opção 1: recuos padrão da zona (com a geometria do lote)
+            # Opção 2: flexibilidade Art. 112 (LC 90/2023) — pode zerar recuos de frente e laterais
+            # (mantém recuo de fundo e mantém TO/TP da zona)
+            # =============================
+            if use_code == "res_unifamiliar":
+                try:
+                    # Opção 1 (padrão)
+                    env_padrao = envelope_area(
+                        testada=testada,
+                        profundidade=profundidade,
+                        rec_fr=float(rec_fr),
+                        rec_fun=float(rec_fun),
+                        rec_lat=float(rec_lat),
+                        esquina=bool(esquina),
+                        corner_two_fronts=bool(corner_two_fronts),
+                        attach_one_side=bool(attach_one_side),
+                    )
+                    area_max_padrao = None
+                    if area_to is not None and env_padrao.get("area_miolo") is not None:
+                        area_max_padrao = min(float(area_to), float(env_padrao["area_miolo"]))
+                    elif env_padrao.get("area_miolo") is not None:
+                        area_max_padrao = float(env_padrao["area_miolo"])
+
+                    # Opção 2 (Art. 112) — zera frente e laterais
+                    env_art112 = envelope_area(
+                        testada=testada,
+                        profundidade=profundidade,
+                        rec_fr=0.0,
+                        rec_fun=float(rec_fun),
+                        rec_lat=0.0,
+                        esquina=bool(esquina),
+                        corner_two_fronts=bool(corner_two_fronts),
+                        attach_one_side=False,  # já está "colado" em ambas as laterais
+                    )
+                    area_max_art112 = None
+                    if area_to is not None and env_art112.get("area_miolo") is not None:
+                        area_max_art112 = min(float(area_to), float(env_art112["area_miolo"]))
+                    elif env_art112.get("area_miolo") is not None:
+                        area_max_art112 = float(env_art112["area_miolo"])
+
+                    calc["opcao_1_recuos_padrao"] = {
+                        "nome": "Recuos padrão da zona",
+                        "base_legal": "Recuos da zona (padrão)",
+                        "recuo_frontal_m": float(rec_fr),
+                        "recuo_lateral_m": float(rec_lat),
+                        "recuo_fundo_m": float(rec_fun),
+                        "largura_util_m": float(env_padrao.get("largura_util") or 0.0),
+                        "profundidade_util_m": float(env_padrao.get("prof_util") or 0.0),
+                        "area_envelope_m2": float(env_padrao.get("area_miolo") or 0.0),
+                        "area_max_terreo_m2": float(area_max_padrao or 0.0),
+                        "limitante": "TO" if (area_to is not None and area_max_padrao is not None and float(area_to) <= float(env_padrao.get("area_miolo") or 0.0)) else "Recuos",
+                    }
+                    calc["opcao_2_art112_sem_recuos_frente_laterais"] = {
+                        "nome": "Art. 112 (flexibilidade) — sem recuos de frente e laterais",
+                        "base_legal": "LC 90/2023 — Art. 112 (Unifamiliar)",
+                        "recuo_frontal_m": 0.0,
+                        "recuo_lateral_m": 0.0,
+                        "recuo_fundo_m": float(rec_fun),
+                        "largura_util_m": float(env_art112.get("largura_util") or 0.0),
+                        "profundidade_util_m": float(env_art112.get("prof_util") or 0.0),
+                        "area_envelope_m2": float(env_art112.get("area_miolo") or 0.0),
+                        "area_max_terreo_m2": float(area_max_art112 or 0.0),
+                        "limitante": "TO" if (area_to is not None and area_max_art112 is not None and float(area_to) <= float(env_art112.get("area_miolo") or 0.0)) else "Recuo de fundo",
+                        "observacao": "Pode zerar recuos de frente e laterais, desde que mantenha TO (máx) e TP (mín) da zona.",
+                    }
+                except Exception:
+                    # Não quebra o app se algo falhar na montagem das opções do relatório
+                    calc["opcao_1_recuos_padrao"] = None
+                    calc["opcao_2_art112_sem_recuos_frente_laterais"] = None
+
     
             calc["pavimentos_estimados"] = estimate_pavimentos(g_pav, g_m)
     
@@ -908,6 +980,12 @@ def main():
         vagas = None
         vagas_texto = None
         vagas_moto_txt = None
+
+        # Regra específica: Residencial Unifamiliar NÃO exige vagas mínimas (Anexo IV - LC 90/2023)
+        if use_code == "res_unifamiliar":
+            vagas = 0
+            vagas_texto = "Residencial unifamiliar: sem exigência mínima de vagas (Anexo IV — LC 90/2023)."
+            vagas_moto_txt = None
     
         if park:
             metric = park.get("metric")
@@ -1465,7 +1543,13 @@ def main():
                         desired_pavimentos=int(desired_pavimentos or 0),
                         area_util_m2=float(area_util_m2 or 0),
                     )
-                    calc["simulacao_leigo"] = sim_leigo
+                    calc["simulacao_leigo"] = sim
+            # Opções de implantação (para o relatório)
+            sim["options"] = {
+                "padrao": calc.get("opcao_1_recuos_padrao"),
+                "alinhamento_art112": calc.get("opcao_2_art112_sem_recuos_frente_laterais"),
+            }
+_leigo
                 else:
                     calc["simulacao_leigo"] = None
     
@@ -1606,6 +1690,12 @@ def main():
                 area_util_m2=float(last_in.get("area_util_m2") or 0),
             )
             calc["simulacao_leigo"] = sim
+            # Opções de implantação (para o relatório)
+            sim["options"] = {
+                "padrao": calc.get("opcao_1_recuos_padrao"),
+                "alinhamento_art112": calc.get("opcao_2_art112_sem_recuos_frente_laterais"),
+            }
+
     
         st.divider()
     st.markdown("## ✅ Viabilidade (para leigo)")
