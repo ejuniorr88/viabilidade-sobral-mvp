@@ -1,6 +1,8 @@
 import folium
 from streamlit_folium import st_folium
 
+import streamlit as st
+st.write("APP CARREGOU ✅")
 
 def render_map(default_center=(-3.689, -40.348), default_zoom=13):
     """
