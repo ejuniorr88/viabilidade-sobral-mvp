@@ -120,7 +120,7 @@ def build_unifamiliar_report_md(res: Dict[str, Any], calc: Dict[str, Any], sim: 
     md.append("**Explicação didática:** Esse é o limite máximo pela **Taxa de Ocupação (TO)**.\n\n")
     md.append("Agora veja duas situações possíveis:\n\n")
 
-    if op1:
+    if op1 is not None:
         md.append("✅ **Opção 1 — Recuos padrão**\n\n")
         md.append("Recuos considerados:\n")
         md.append(f"- Frontal: {_fmt_m(op1.get('recuo_frontal_m'))}\n")
@@ -132,7 +132,7 @@ def build_unifamiliar_report_md(res: Dict[str, Any], calc: Dict[str, Any], sim: 
         md.append(f"- **{_fmt_m2(op1.get('area_max_terreo_m2'))}**\n\n")
         md.append("> Mesmo podendo ocupar pela TO, o **miolo** (recuos) pode reduzir o máximo real.\n\n")
 
-    if op2:
+    if op2 is not None:
         md.append("✅ **Opção 2 — Implantação no alinhamento (Art. 112 – LC 90/2023)**\n\n")
         md.append("Por ser residência unifamiliar, a legislação permite **zerar recuos frontal e laterais**, desde que respeite TO e TP.\n\n")
         md.append("Recuos considerados:\n")
@@ -144,6 +144,41 @@ def build_unifamiliar_report_md(res: Dict[str, Any], calc: Dict[str, Any], sim: 
         md.append("Máximo no térreo (respeitando TO):\n")
         md.append(f"- **{_fmt_m2(op2.get('area_max_terreo_m2'))}**\n\n")
 
+
+        # --- Projeto do usuário (se informado) ---
+        try:
+            total_proj_val = float(total_proj) if total_proj is not None else 0.0
+        except Exception:
+            total_proj_val = 0.0
+        if total_proj_val and pav:
+            # estimativa simples: dividir igualmente por pavimentos
+            area_terreo_proj = total_proj_val / max(1, int(pav))
+            to_real_proj = area_terreo_proj / area_lote if area_lote else 0.0
+            area_restante_proj = max(0.0, area_lote - area_terreo_proj) if area_lote else 0.0
+            area_imper_proj = max(0.0, area_restante_proj - tp_min) if tp_min is not None else None
+
+            md.append("### ✅ Se você informou uma área para o seu projeto
+
+")
+            md.append(f"- Área total informada: **{_fmt_m2(total_proj_val)}** em **{pav}** pavimentos (estimativa: pavimentos iguais)\n")
+            md.append(f"- Área estimada no térreo: **{_fmt_m2(area_terreo_proj)}**\n")
+            md.append(f"- Isso dá uma **TO do seu projeto** de **{_fmt_pct(to_real_proj)}**\n\n")
+
+            if tp_min is not None:
+                md.append("**Permeabilidade (TP) com a sua área no térreo:**\n")
+                md.append(f"- Área restante no lote: {_fmt_m2(area_lote)} − {_fmt_m2(area_terreo_proj)} = **{_fmt_m2(area_restante_proj)}**\n")
+                md.append(f"- Desses, **{_fmt_m2(tp_min)}** devem ser permeáveis (solo)\n")
+                if area_imper_proj is not None:
+                    md.append(f"- O restante (**{_fmt_m2(area_imper_proj)}**) pode ser piso impermeável\n\n")
+
+            # checagem simples contra os máximos de cada opção (se disponíveis)
+            if op1 is not None and op1.get("area_max_terreo_m2") is not None:
+                ok1 = area_terreo_proj <= float(op1.get("area_max_terreo_m2") or 0)
+                md.append(f"- Checagem (recuos padrão): seu térreo {_fmt_m2(area_terreo_proj)} vs máx {_fmt_m2(op1.get('area_max_terreo_m2'))} → **{'OK' if ok1 else 'ULTRAPASSA'}**\n")
+            if op2 is not None and op2.get("area_max_terreo_m2") is not None:
+                ok2 = area_terreo_proj <= float(op2.get("area_max_terreo_m2") or 0)
+                md.append(f"- Checagem (Art. 112): seu térreo {_fmt_m2(area_terreo_proj)} vs máx {_fmt_m2(op2.get('area_max_terreo_m2'))} → **{'OK' if ok2 else 'ULTRAPASSA'}**\n")
+            md.append("\n")
     md.append("---\n\n")
     md.append("## 🌿 2️⃣ Quanto preciso deixar livre?\n\n")
     md.append("**Pergunta:** Quanto preciso deixar permeável?\n\n")
@@ -192,9 +227,9 @@ def build_unifamiliar_report_md(res: Dict[str, Any], calc: Dict[str, Any], sim: 
     md.append(f"- TO máx: {_fmt_pct(to_pct)} (≈ {_fmt_m2(to_teor)} no térreo)\n")
     md.append(f"- TP mín: {_fmt_pct(tp_pct)} (≈ {_fmt_m2(tp_min)} permeável)\n")
     md.append(f"- IA máx: {ia_max if ia_max is not None else '—'} (≈ {_fmt_m2(ia_total)} total)\n")
-    if op1:
+    if op1 is not None:
         md.append(f"- Máx. térreo (recuos padrão): {_fmt_m2(op1.get('area_max_terreo_m2'))}\n")
-    if op2:
+    if op2 is not None:
         md.append(f"- Máx. térreo (Art. 112): {_fmt_m2(op2.get('area_max_terreo_m2'))}\n")
 
     return "".join(md)

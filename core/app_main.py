@@ -1,3 +1,4 @@
+APP_VERSION = 'unifamiliar-v5'
 def main():
     import os
     import json
