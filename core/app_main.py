@@ -982,7 +982,7 @@ def main():
         vagas_moto_txt = None
 
         # Regra específica: Residencial Unifamiliar NÃO exige vagas mínimas (Anexo IV - LC 90/2023)
-        if use_code == "res_unifamiliar":
+        if str(use_code).upper().startswith("RES_UNI") or str(use_code).lower() == "res_unifamiliar":
             vagas = 0
             vagas_texto = "Residencial unifamiliar: sem exigência mínima de vagas (Anexo IV — LC 90/2023)."
             vagas_moto_txt = None
@@ -1543,13 +1543,16 @@ def main():
                         desired_pavimentos=int(desired_pavimentos or 0),
                         area_util_m2=float(area_util_m2 or 0),
                     )
-                    calc["simulacao_leigo"] = sim
-            # Opções de implantação (para o relatório)
-            sim["options"] = {
-                "padrao": calc.get("opcao_1_recuos_padrao"),
-                "alinhamento_art112": calc.get("opcao_2_art112_sem_recuos_frente_laterais"),
-            }
-_leigo
+
+                    # Opções de implantação (para o relatório)
+                    # - padrao: recuos padrão da zona
+                    # - alinhamento_art112: frontal e laterais podem zerar (Art. 112) — fundo mantém
+                    sim_leigo["options"] = {
+                        "padrao": calc.get("opcao_1_recuos_padrao"),
+                        "alinhamento_art112": calc.get("opcao_2_art112_sem_recuos_frente_laterais"),
+                    }
+
+                    calc["simulacao_leigo"] = sim_leigo
                 else:
                     calc["simulacao_leigo"] = None
     
