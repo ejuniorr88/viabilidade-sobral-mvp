@@ -1500,6 +1500,7 @@ def main():
     
                 zona_sigla = res.get("zona_sigla") or ""
                 rule = sb_get_zone_rule(zona_sigla, use_code)
+                st.write("DEBUG:", rule)
     
                 # estacionamento: v2 + fallback antigo
                 park_v2 = sb_get_parking_rule_v2(use_code)
