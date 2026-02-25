@@ -1,4 +1,5 @@
-from core.app_main import main
+import streamlit as st
+from core.viabilidade_res_unifamiliar import render_unifamiliar
 
-if __name__ == "__main__":
-    main()
+st.set_page_config(layout="wide", page_title="Viabilidade")
+render_unifamiliar()
