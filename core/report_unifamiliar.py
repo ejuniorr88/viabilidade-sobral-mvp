@@ -157,9 +157,7 @@ def build_unifamiliar_report_md(res: Dict[str, Any], calc: Dict[str, Any], sim: 
             area_restante_proj = max(0.0, area_lote - area_terreo_proj) if area_lote else 0.0
             area_imper_proj = max(0.0, area_restante_proj - tp_min) if tp_min is not None else None
 
-            md.append("### ✅ Se você informou uma área para o seu projeto
-
-")
+            md.append("### ✅ Se você informou uma área para o seu projeto\n\n")
             md.append(f"- Área total informada: **{_fmt_m2(total_proj_val)}** em **{pav}** pavimentos (estimativa: pavimentos iguais)\n")
             md.append(f"- Área estimada no térreo: **{_fmt_m2(area_terreo_proj)}**\n")
             md.append(f"- Isso dá uma **TO do seu projeto** de **{_fmt_pct(to_real_proj)}**\n\n")
